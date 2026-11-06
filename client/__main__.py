@@ -2,12 +2,12 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from .echo_window import EchoWindow
+from .lobby_window import LobbyWindow
 
 
 def main() -> int:
     app = QApplication(sys.argv)
-    window = EchoWindow()
+    window = LobbyWindow()
     window.show()
     return app.exec()
 

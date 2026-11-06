@@ -1,6 +1,9 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
+from .lobby import router as lobby_router
+
 app = FastAPI(title="Story Host")
+app.include_router(lobby_router)
 
 
 @app.get("/health")
