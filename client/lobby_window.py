@@ -14,7 +14,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from chat_protocol import CHAT_MESSAGE, CHAT_SEND, LOBBY_PATH, decode_event
+from chat_protocol import (
+    CHAT_ERROR,
+    CHAT_MESSAGE,
+    CHAT_SEND,
+    LOBBY_PATH,
+    MAX_TEXT_LENGTH,
+    chat_text_error,
+    decode_event,
+)
 
 SocketState = QAbstractSocket.SocketState
 
@@ -25,6 +33,13 @@ STATE_LABELS = {
     SocketState.ConnectedState: "已连接",
     SocketState.ClosingState: "正在断开…",
     SocketState.UnconnectedState: "未连接",
+}
+
+
+SEND_ERRORS = {
+    "invalid_text": "消息正文必须是文本。",
+    "empty_text": "请输入消息，正文不能只有空白。",
+    "text_too_long": f"消息最多 {MAX_TEXT_LENGTH:,} 个字符。",
 }
 
 
@@ -51,9 +66,10 @@ class LobbyWindow(QWidget):
         self.chat_history = QPlainTextEdit()
         self.chat_history.setReadOnly(True)
         self.message = QPlainTextEdit()
-        self.message.setPlaceholderText("输入测试消息")
+        self.message.setPlaceholderText("输入消息")
         self.message.setFixedHeight(80)
         self.send_button = QPushButton("发送")
+        self._awaiting_send = False
 
         self._build_layout()
         self._connect_signals()
@@ -132,13 +148,26 @@ class LobbyWindow(QWidget):
         self.nickname.setEnabled(idle)
         self.connect_button.setEnabled(idle)
         self.disconnect_button.setEnabled(not idle and state != SocketState.ClosingState)
-        self.send_button.setEnabled(connected)
+        if not connected and self._awaiting_send:
+            self._awaiting_send = False
+            self.feedback.setText("连接已断开，消息未确认，草稿已保留。")
+
+        self._update_send_controls()
+
+    def _update_send_controls(self) -> None:
+        connected = self.socket.state() == SocketState.ConnectedState
+        self.send_button.setEnabled(connected and not self._awaiting_send)
+        self.message.setReadOnly(self._awaiting_send)
 
     @Slot()
     def _send_message(self) -> None:
+        if not self.send_button.isEnabled():
+            return
+
         text = self.message.toPlainText()
-        if not text.strip():
-            self.feedback.setText("请输入测试消息。")
+        error = chat_text_error(text)
+        if error is not None:
+            self.feedback.setText(SEND_ERRORS[error])
             return
 
         payload = json.dumps({"type": CHAT_SEND, "text": text})
@@ -146,20 +175,36 @@ class LobbyWindow(QWidget):
             self.feedback.setText("发送失败，请检查连接后重试。")
             return
 
-        self.feedback.clear()
-        self.message.clear()
+        self._awaiting_send = True
+        self._update_send_controls()
+        self.feedback.setText("等待主机确认…")
 
     @Slot(str)
     def _show_message(self, payload: str) -> None:
         event = decode_event(payload)
-        if event is None or event.get("type") != CHAT_MESSAGE:
+        if event is None:
             self.feedback.setText("收到无法识别的大厅消息。")
             return
 
-        nickname = event.get("nickname")
-        text = event.get("text")
-        if isinstance(nickname, str) and isinstance(text, str):
-            self.chat_history.appendPlainText(f"{nickname}：{text}")
+        event_type = event.get("type")
+        if event_type == CHAT_ERROR:
+            self._show_send_error(event.get("code"))
+        elif event_type == CHAT_MESSAGE:
+            nickname = event.get("nickname")
+            text = event.get("text")
+            if isinstance(nickname, str) and isinstance(text, str):
+                self.chat_history.appendPlainText(f"{nickname}：{text}")
+                if event.get("own") is True and self._awaiting_send:
+                    self.message.clear()
+                    self.feedback.clear()
+                    self._awaiting_send = False
+                    self._update_send_controls()
+
+    def _show_send_error(self, code: object) -> None:
+        message = SEND_ERRORS.get(code) if isinstance(code, str) else None
+        self.feedback.setText(message or "主机拒绝发送这条消息。")
+        self._awaiting_send = False
+        self._update_send_controls()
 
     def _show_socket_error(self, _error: QAbstractSocket.SocketError) -> None:
         self.feedback.setText(f"连接错误：{self.socket.errorString()}")

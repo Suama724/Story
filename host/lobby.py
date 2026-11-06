@@ -3,7 +3,14 @@ from asyncio import Lock
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
-from chat_protocol import CHAT_MESSAGE, CHAT_SEND, LOBBY_PATH, decode_event
+from chat_protocol import (
+    CHAT_ERROR,
+    CHAT_MESSAGE,
+    CHAT_SEND,
+    LOBBY_PATH,
+    chat_text_error,
+    decode_event,
+)
 
 router = APIRouter()
 _connections: set[WebSocket] = set()
@@ -35,14 +42,21 @@ async def join_lobby(websocket: WebSocket) -> None:
                 continue
 
             text = event.get("text")
-            if isinstance(text, str):
-                await _broadcast_message(nickname, text)
+            error = chat_text_error(text)
+            if isinstance(text, str) and error is None:
+                await _broadcast_message(websocket, nickname, text)
+            else:
+                await websocket.send_text(json.dumps({"type": CHAT_ERROR, "code": error}))
+    except WebSocketDisconnect:
+        return
     finally:
         _connections.discard(websocket)
 
 
-async def _broadcast_message(nickname: str, text: str) -> None:
-    payload = json.dumps({"type": CHAT_MESSAGE, "nickname": nickname, "text": text})
+async def _broadcast_message(sender: WebSocket, nickname: str, text: str) -> None:
+    event = {"type": CHAT_MESSAGE, "nickname": nickname, "text": text}
+    payload = json.dumps(event)
+    sender_payload = json.dumps({**event, "own": True})
 
     # 按整条消息广播，让各窗口看到一致的顺序。
     async with _broadcast_lock:
@@ -51,6 +65,6 @@ async def _broadcast_message(nickname: str, text: str) -> None:
                 continue
 
             try:
-                await connection.send_text(payload)
+                await connection.send_text(sender_payload if connection is sender else payload)
             except WebSocketDisconnect:
                 _connections.discard(connection)
