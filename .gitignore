@@ -7,6 +7,7 @@ build/
 dist/
 *.egg-info/
 .env
+/data/
 
 # Local requirements and notes
 /软件需求工作台/
