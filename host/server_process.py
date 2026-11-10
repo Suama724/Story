@@ -6,14 +6,11 @@ import socket
 import sys
 import threading
 from pathlib import Path
+from uuid import uuid4
 
 import uvicorn
-from starlette.concurrency import run_in_threadpool
-
-from chat_protocol import chat_text_error
 
 from .app import create_app
-from .storage import campaign_info, open_campaign
 
 
 def emit(event: str, **values: object) -> None:
@@ -42,24 +39,15 @@ async def run_server(directory: Path, host: str, port: int) -> int:
         emit("error", message=f"无法监听 {host}:{port}，{error}")
         return 1
 
-    def kp_name() -> str:
-        with open_campaign(directory) as connection:
-            info = campaign_info(connection)
-            actor = connection.execute("SELECT name FROM actors WHERE id = ?", (info["kp_actor_id"],)).fetchone()
-        return actor["name"]
-
     async def handle(command: dict[str, object]) -> None:
         try:
             async with application.state.lobby.lock:
                 if command.get("command") == "stop":
                     server.should_exit = True
                 elif command.get("command") == "say":
-                    text = command.get("text")
-                    if not isinstance(text, str) or chat_text_error(text) is not None:
-                        raise ValueError("消息须为 1–2,000 个字符的非空白文本。")
-                    nickname = await run_in_threadpool(kp_name)
-                    await application.state.lobby.broadcast_message(None, nickname, text)
-                    emit("sent", request_id=command.get("request_id"))
+                    request_id = command.get("request_id", str(uuid4()))
+                    message = await application.state.lobby.send_campaign_message(command.get("text"), request_id)
+                    emit("sent", request_id=request_id, message=message)
         except Exception as error:
             emit("error", message=str(error), request_id=command.get("request_id"))
 

@@ -59,7 +59,7 @@ class MemberSession:
         return info
 
 
-def _session(connection: sqlite3.Connection, token: str) -> MemberSession:
+def session_for_token(connection: sqlite3.Connection, token: str) -> MemberSession:
     row = connection.execute(
         """SELECT s.token_hash, c.id AS campaign_id, c.name AS campaign_name,
                   m.id AS member_id, m.role, a.id AS actor_id, a.name AS actor_name, s.expires_at
@@ -84,9 +84,7 @@ class AuthService:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if campaign_name.strip() != campaign_info(connection)["name"]:
-                    raise AuthError("campaign_mismatch", "团名与主机当前开启的团不一致。", 400)
-                if not 1 <= len(password) <= 256:
-                    raise AuthError("invalid_credentials", "角色名或密码错误。")
+                    raise AuthError("campaign_mismatch", "角色信息错误", 400)
                 credential = connection.execute(
                     """SELECT m.id AS member_id, c.password, c.password_hash
                        FROM actors AS a
@@ -95,8 +93,10 @@ class AuthService:
                        WHERE a.kind = 'pc' AND a.name = ? COLLATE NOCASE""",
                     (actor_name.strip(),),
                 ).fetchone()
-                if credential is None or not _password_matches(password, credential):
-                    raise AuthError("invalid_credentials", "角色名或密码错误。")
+                if credential is None:
+                    raise AuthError("actor_not_found", "角色信息错误")
+                if not 1 <= len(password) <= 256 or not _password_matches(password, credential):
+                    raise AuthError("invalid_credentials", "密码错误")
                 member_id = credential["member_id"]
                 token = secrets.token_urlsafe(32)
                 connection.execute("DELETE FROM auth_sessions WHERE member_id = ?", (member_id,))
@@ -104,12 +104,12 @@ class AuthService:
                     "INSERT INTO auth_sessions (token_hash, member_id, expires_at) VALUES (?, ?, ?)",
                     (_token_hash(token), member_id, time.time() + SESSION_SECONDS),
                 )
-                session = _session(connection, token)
+                session = session_for_token(connection, token)
         return {"token": token, **session.public_info()}
 
     def require_session(self, token: str) -> MemberSession:
         with open_campaign(self.directory) as connection:
-            return _session(connection, token)
+            return session_for_token(connection, token)
 
     def change_password(self, token: str, current_password: str, new_password: str) -> None:
         if not 1 <= len(new_password) <= 256 or not new_password.strip():
@@ -123,7 +123,7 @@ class AuthService:
         with open_campaign(self.directory) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
-                session = _session(connection, token)
+                session = session_for_token(connection, token)
                 credential = connection.execute(
                     """SELECT c.password, c.password_hash FROM members AS m
                        LEFT JOIN credentials AS c ON c.member_id = m.id WHERE m.id = ?""",
@@ -144,6 +144,6 @@ class AuthService:
         with open_campaign(self.directory) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
-                session = _session(connection, token)
+                session = session_for_token(connection, token)
                 connection.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (session.token_hash,))
         return session.member_id

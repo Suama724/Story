@@ -73,6 +73,17 @@ class CampaignStorageTests(unittest.TestCase):
         self.assertFalse(self.root.exists())
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_v3_campaign_keeps_identity_when_adding_messages(self) -> None:
+        with patch.object(migrations, "SCHEMA_VERSION", 3):
+            directory = initialize_campaign(self.root, "旧团", description="保留的简介")
+            with open_campaign(directory) as connection:
+                original = campaign_info(connection)
+
+        with open_campaign(directory) as connection:
+            self.assertEqual(campaign_info(connection), {**original, "schema_version": 4})
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
     def test_blank_names_do_not_create_directories(self) -> None:
         with self.assertRaises(ValueError):
             initialize_campaign(self.root, "  ")

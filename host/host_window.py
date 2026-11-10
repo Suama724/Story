@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from chat_protocol import chat_text_error
+from client.chat_history import ChatHistory
 
 from .management import add_member, campaign_details, discover_campaigns, edit_member
 from .server_controller import ServerController
@@ -125,11 +126,11 @@ class HostWindow(QMainWindow):
         self._returning = False
         self._refresh_pending = False
         self._pending_send: str | None = None
+        self._retry_send: tuple[str, str] | None = None
         self.server = ServerController(self)
         self.server.stateChanged.connect(self._network_state)
         self.server.errorOccurred.connect(self._report_error)
         self.server.logReceived.connect(self._append_log)
-        self.server.messageReceived.connect(self._show_message)
         self.server.sendConfirmed.connect(self._send_confirmed)
         self.server.sendFailed.connect(self._send_failed)
         self.server.passwordChanged.connect(self._reload_campaign)
@@ -296,8 +297,8 @@ class HostWindow(QMainWindow):
         channel, channel_layout = panel()
         channel_layout.addWidget(label("总频道", "heading"))
         self.tabs = QTabWidget()
-        self.messages = QPlainTextEdit()
-        self.messages.setReadOnly(True)
+        self.messages = ChatHistory()
+        self.server.messageReceived.connect(self.messages.add_message)
         self.messages.setMaximumBlockCount(2000)
         self.messages.setPlaceholderText("本次运行的消息将在这里显示。")
         self.logs = QPlainTextEdit()
@@ -412,6 +413,7 @@ class HostWindow(QMainWindow):
         self.campaign_description.setVisible(bool(description))
         self.header_state.setText("本地管理 · 监听已关闭")
         self.messages.clear()
+        self._retry_send = None
         self.message_input.clear()
         self.pages.setCurrentIndex(1)
         self._populate_members()
@@ -525,15 +527,19 @@ class HostWindow(QMainWindow):
         if chat_text_error(text) is not None:
             self._report_error("消息须为 1–2,000 个字符的非空白文本。")
             return
-        request_id = str(uuid4())
+        if self._retry_send is None or self._retry_send[0] != text:
+            self._retry_send = (text, str(uuid4()))
+        request_id = self._retry_send[1]
         if self.server.command("say", text=text, request_id=request_id):
             self._pending_send = request_id
             self.message_input.setReadOnly(True)
             self._update_buttons()
 
-    def _send_confirmed(self, request_id: str) -> None:
+    def _send_confirmed(self, request_id: str, message: dict[str, object]) -> None:
         if request_id == self._pending_send:
+            self.messages.add_message(message)
             self._pending_send = None
+            self._retry_send = None
             self.message_input.clear()
             self.message_input.setReadOnly(False)
             self._update_buttons()
@@ -543,9 +549,6 @@ class HostWindow(QMainWindow):
             self._pending_send = None
             self.message_input.setReadOnly(False)
             self._update_buttons()
-
-    def _show_message(self, message: dict) -> None:
-        self.messages.appendPlainText(f"{message['nickname']}：{message['text']}")
 
     def _switch_campaign(self) -> None:
         if self.server.active:

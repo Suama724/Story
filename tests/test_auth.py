@@ -61,7 +61,7 @@ class AuthTests(unittest.TestCase):
             connection.execute("INSERT INTO credentials VALUES (?, ?, 1, 0)", (pending, password_hash))
         with open_campaign(directory) as connection:
             self.assertEqual(campaign_info(connection)["description"], "")
-            self.assertEqual(campaign_info(connection)["schema_version"], 3)
+            self.assertEqual(campaign_info(connection)["schema_version"], migrations.SCHEMA_VERSION)
             self.assertFalse(connection.execute("PRAGMA foreign_key_check").fetchall())
         members = {member["member_id"]: member for member in list_members(directory)}
         self.assertEqual(members[existing]["actor_name"], "调查员")
@@ -161,8 +161,9 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
         add_member(self.directory, "调查员")
         self.password_events = []
         self.player_logs = []
+        self.broadcasts = []
         self.application = create_app(
-            self.directory, on_password_changed=lambda: self.password_events.append(True),
+            self.directory, self.broadcasts.append, on_password_changed=lambda: self.password_events.append(True),
             on_player_log=self.player_logs.append,
         )
         self.listener = socket.socket()
@@ -227,6 +228,61 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(event["nickname"], "调查员")
             self.assertEqual(event["text"], "中文 🎲\n第二行")
             self.assertTrue(event["own"])
+
+    async def test_message_retry_conflict_and_order(self) -> None:
+        ready = await self.login()
+        async with connect(self.ws, additional_headers={"Authorization": f"Bearer {ready['token']}"},
+                           proxy=None) as websocket:
+            async def send(request_id, text):
+                await websocket.send(json.dumps({"type": "chat.send", "request_id": request_id, "text": text}))
+                return json.loads(await asyncio.wait_for(websocket.recv(), timeout=3))
+
+            text = "骰子 🎲\n第二行  "
+            ack = await send("player-1", text)
+            self.assertEqual((ack["type"], ack["request_id"]), ("chat.ack", "player-1"))
+            first = ack["message"]
+            self.assertEqual(first["sequence"], 1)
+            self.assertEqual(first["text"], text)
+            self.assertEqual(first["actor_id"], ready["actor_id"])
+            self.assertEqual(json.loads(await asyncio.wait_for(websocket.recv(), timeout=3)), first)
+            self.assertEqual(await send("player-1", text), ack)
+            self.assertEqual(await send("player-1", "不同正文"), {
+                "type": "chat.error", "request_id": "player-1", "code": "request_id_conflict",
+            })
+            self.assertEqual((await send(None, "无效 ID"))["code"], "invalid_request_id")
+            second = (await send("player-2", "下一条"))["message"]
+            self.assertEqual(second["sequence"], 2)
+            self.assertNotEqual(second["message_id"], first["message_id"])
+            self.assertEqual(json.loads(await asyncio.wait_for(websocket.recv(), timeout=3)), second)
+
+        self.assertEqual(self.broadcasts, [first, second])
+        with open_campaign(self.directory) as connection:
+            rows = connection.execute("SELECT message_id, request_id FROM messages ORDER BY sequence").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [
+                (first["message_id"], "player-1"), (second["message_id"], "player-2"),
+            ])
+
+    async def test_failed_message_write_rolls_back_without_broadcast(self) -> None:
+        ready = await self.login()
+        with open_campaign(self.directory) as connection, connection:
+            connection.execute("""CREATE TRIGGER reject_message AFTER INSERT ON messages
+                                  BEGIN SELECT RAISE(FAIL, '模拟写入失败'); END""")
+        async with connect(self.ws, additional_headers={"Authorization": f"Bearer {ready['token']}"},
+                           proxy=None) as websocket:
+            payload = json.dumps({"type": "chat.send", "request_id": "retry", "text": "失败后重发"})
+            await websocket.send(payload)
+            self.assertEqual(json.loads(await asyncio.wait_for(websocket.recv(), timeout=3)), {
+                "type": "chat.error", "request_id": "retry", "code": "storage_error",
+            })
+            self.assertEqual(self.broadcasts, [])
+            with open_campaign(self.directory) as connection, connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+                connection.execute("DROP TRIGGER reject_message")
+            await websocket.send(payload)
+            ack = json.loads(await asyncio.wait_for(websocket.recv(), timeout=3))
+            self.assertEqual(ack["type"], "chat.ack")
+            self.assertEqual(ack["message"]["sequence"], 1)
+            self.assertEqual(json.loads(await asyncio.wait_for(websocket.recv(), timeout=3)), ack["message"])
 
     async def test_relogin_closes_old_socket_and_invalidates_old_token(self) -> None:
         first = await self.login()

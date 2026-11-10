@@ -12,7 +12,7 @@ class ServerController(QObject):
     messageReceived = Signal(object)
     logReceived = Signal(str)
     errorOccurred = Signal(str)
-    sendConfirmed = Signal(str)
+    sendConfirmed = Signal(str, object)
     sendFailed = Signal(str)
     passwordChanged = Signal()
 
@@ -95,7 +95,7 @@ class ServerController(QObject):
             elif kind == "log":
                 self.logReceived.emit(event["message"])
             elif kind == "sent":
-                self.sendConfirmed.emit(str(event["request_id"]))
+                self.sendConfirmed.emit(str(event["request_id"]), event["message"])
             elif kind == "password_changed":
                 self.passwordChanged.emit()
             elif kind == "error":

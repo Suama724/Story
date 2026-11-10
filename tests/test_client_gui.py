@@ -16,9 +16,11 @@ from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import QApplication
 
 from client.auth_client import ClientSession, server_urls
+from client.history_cache import HistoryCache
 from client.player_window import PasswordDialog, PlayerWindow
 from host.auth import AuthError, AuthService, DEFAULT_PASSWORD
 from host.management import add_member
+from host.messages import save_lobby_message
 from host.server_controller import ServerController
 from host.storage import initialize_campaign
 
@@ -55,6 +57,26 @@ class AddressTests(unittest.TestCase):
                      "http://localhost/#fragment"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 server_urls(text)
+
+
+class HistoryCacheTests(unittest.TestCase):
+    def test_scope_and_sync_position_survive_reopen_without_skipping_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            cache = HistoryCache(path, "campaign", "member")
+
+            def message(sequence):
+                return {"message_id": str(sequence), "sequence": sequence, "nickname": "KP", "text": "正文"}
+
+            cache.save([message(7), message(8)], latest=True)
+            cache.save([message(10)])
+            reopened = HistoryCache(path, "campaign", "member")
+            self.assertEqual(reopened.position(), 8)
+            reopened.save([message(9), message(10)])
+            self.assertEqual(reopened.position(), 10)
+            self.assertEqual(reopened.page(before=9), [message(7), message(8)])
+            self.assertEqual(HistoryCache(path, "campaign", "other-member").page(), [])
+            self.assertEqual(HistoryCache(path, "other-campaign", "member").page(), [])
 
 
 class ClientGuiTests(unittest.TestCase):
@@ -131,28 +153,35 @@ class ClientGuiTests(unittest.TestCase):
         self.player.lobby.send_button.click()
         self.wait_until(lambda: not self.player.lobby._awaiting_send)
         self.assertEqual(self.player.lobby.message.toPlainText(), "")
-        self.assertIn("调查员甲：中文 🎲\n第二行  ", self.player.lobby.chat_history.toPlainText())
         self.player.lobby.socket.sendTextMessage(json.dumps({
             "type": "chat.send", "text": "伪造发言人", "nickname": "KP", "member_id": "someone-else",
         }))
         self.wait_until(lambda: "伪造发言人" in self.player.lobby.chat_history.toPlainText())
-        self.assertIn("调查员甲：伪造发言人", self.player.lobby.chat_history.toPlainText())
+        history = self.player.lobby.chat_history.toPlainText()
+        self.assertEqual(history.count("调查员甲：中文 🎲\n第二行  "), 1)
+        self.assertIn("调查员甲：伪造发言人", history)
 
     def test_wrong_password_stays_on_login(self) -> None:
-        self.login(self.player, "wrong")
-        self.assertIsNone(self.player.session)
-        self.assertEqual(self.player.pages.currentIndex(), 0)
-        self.assertIn("错误", self.player.feedback.text())
-        self.assertTrue(self.player.login_button.isEnabled())
+        for password in ("", "wrong"):
+            self.login(self.player, password)
+            self.assertIsNone(self.player.session)
+            self.assertEqual(self.player.pages.currentIndex(), 0)
+            self.assertEqual(self.player.feedback.text(), "密码错误")
+            self.assertTrue(self.player.login_button.isEnabled())
 
     def test_campaign_name_is_required_and_checked_by_host(self) -> None:
-        for name, message in (("", "请填写团名"), ("别的团", "团名与主机当前开启的团不一致")):
+        for name in ("", "别的团"):
             self.player.campaign_name.setText(name)
             self.login(self.player, DEFAULT_PASSWORD)
             self.assertIsNone(self.player.session)
             self.assertEqual(self.player.pages.currentIndex(), 0)
-            self.assertIn(message, self.player.feedback.text())
+            self.assertEqual(self.player.feedback.text(), "角色信息错误")
         self.player.campaign_name.setText("玩家联调团")
+        self.player.actor_name.setText("不存在的角色")
+        self.login(self.player, "")
+        self.assertIsNone(self.player.lobby)
+        self.assertEqual(self.player.feedback.text(), "角色信息错误")
+        self.player.actor_name.setText("调查员甲")
         self.ready_player()
 
     def test_password_dialog_and_recent_login_switching(self) -> None:
@@ -239,21 +268,101 @@ class ClientGuiTests(unittest.TestCase):
         with self.assertRaises(AuthError):
             self.service.require_session(token)
 
-    def test_stopped_host_keeps_draft_and_allows_manual_reconnect(self) -> None:
+    def test_lost_confirmation_keeps_draft_and_reuses_request_after_reconnect(self) -> None:
         self.ready_player()
-        self.player.lobby.message.setPlainText("停服时的草稿 🎲")
+        lobby = self.player.lobby
+        draft = "停服时的草稿 🎲"
+        lobby.socket.textMessageReceived.disconnect(lobby._show_message)
+        lobby.message.setPlainText(draft)
+        lobby.send_button.click()
+        self.wait_until(lambda: any(event["text"] == draft for event in self.server_messages))
+        self.assertTrue(lobby._awaiting_send)
         self.server.stop()
         self.wait_until(lambda: not self.server.active)
         self.wait_until(lambda: not self.player._busy)
         self.assertIsNotNone(self.player.session)
-        self.assertEqual(self.player.lobby.message.toPlainText(), "停服时的草稿 🎲")
+        self.assertEqual(lobby.message.toPlainText(), draft)
+
+        lobby.socket.textMessageReceived.connect(lobby._show_message)
         self.server.start(self.directory, "127.0.0.1", self.port)
         self.wait_until(lambda: self.server.state == "running")
-        self.player.lobby.connect_button.click()
-        self.wait_until(lambda: self.player.lobby.socket.state() == CONNECTED)
-        self.player.lobby.send_button.click()
-        self.wait_until(lambda: not self.player.lobby._awaiting_send)
-        self.assertIn("停服时的草稿 🎲", self.player.lobby.chat_history.toPlainText())
+        lobby.connect_button.click()
+        self.wait_until(lambda: lobby.socket.state() == CONNECTED)
+        self.server.command("say", text="重启后的新消息")
+        self.wait_until(lambda: "重启后的新消息" in lobby.chat_history.toPlainText())
+        lobby.send_button.click()
+        self.wait_until(lambda: not lobby._awaiting_send)
+        self.assertEqual(lobby.message.toPlainText(), "")
+        self.assertEqual(lobby.chat_history.toPlainText().splitlines(), [
+            f"调查员甲：{draft}", "KP：重启后的新消息",
+        ])
+        self.assertEqual(sum(event["text"] == draft for event in self.server_messages), 1)
+
+    def test_saved_role_reads_paged_history_offline_and_catches_up_when_reconnected(self) -> None:
+        def populate(first, last):
+            for number in range(first, last + 1):
+                save_lobby_message(self.directory, f"seed-{number}", f"历史 {number:03d}", token=None)
+
+        populate(1, 55)
+        self.player.remember_password.setChecked(False)
+        self.ready_player()
+        self.assertEqual(self.player.history.entries()[0]["password"], "")
+        lobby = self.player.lobby
+        self.wait_until(lambda: "历史 055" in lobby.chat_history.toPlainText())
+        self.assertEqual(len(lobby.chat_history.toPlainText().splitlines()), 50)
+        lobby.older_button.click()
+        self.wait_until(lambda: "历史 001" in lobby.chat_history.toPlainText())
+
+        reopened = self.new_player()
+        self.login(reopened, "wrong")
+        self.assertIsNone(reopened.lobby)
+        self.player.close()
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        for password in ("", "wrong"):
+            self.login(reopened, password)
+            self.assertIsNone(reopened.lobby)
+            self.assertEqual(reopened.feedback.text(), "密码错误")
+        for field in (reopened.actor_name, reopened.campaign_name):
+            saved_value = field.text()
+            field.setText("不存在")
+            self.login(reopened, DEFAULT_PASSWORD)
+            self.assertIsNone(reopened.lobby)
+            self.assertEqual(reopened.feedback.text(), "角色信息错误")
+            field.setText(saved_value)
+        self.login(reopened, DEFAULT_PASSWORD)
+        self.assertIsNone(reopened.session)
+        lobby = reopened.lobby
+        self.assertEqual(lobby.connection_status.text(), "未连接")
+        self.assertTrue(lobby.message.isReadOnly())
+        self.assertFalse(lobby.send_button.isEnabled())
+        self.assertIn("历史 055", lobby.chat_history.toPlainText())
+        lobby.older_button.click()
+        self.assertIn("历史 001", lobby.chat_history.toPlainText())
+
+        populate(56, 110)
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait_until(lambda: self.server.state == "running")
+        with patch("client.player_window.QInputDialog.getText", return_value=(DEFAULT_PASSWORD, True)):
+            lobby.connect_button.click()
+        self.wait_until(lambda: reopened.session is not None and reopened.lobby.socket.state() == CONNECTED)
+        lobby = reopened.lobby
+        self.wait_until(lambda: "历史 110" in lobby.chat_history.toPlainText())
+        lines = lobby.chat_history.toPlainText().splitlines()
+        self.assertEqual(lines, [f"KP：历史 {number:03d}" for number in range(1, 111)])
+        self.assertTrue(lobby.send_button.isEnabled())
+
+    def test_password_rejected_by_host_cannot_unlock_offline_history(self) -> None:
+        self.ready_player()
+        self.service.change_password(self.player.session.token, DEFAULT_PASSWORD, PASSWORD)
+        reopened = self.new_player()
+        self.login(reopened, DEFAULT_PASSWORD)
+        self.assertEqual(reopened.feedback.text(), "密码错误")
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        self.login(reopened, DEFAULT_PASSWORD)
+        self.assertIsNone(reopened.lobby)
+        self.assertEqual(reopened.feedback.text(), "密码错误")
 
 
 if __name__ == "__main__":

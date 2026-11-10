@@ -115,5 +115,11 @@ class AuthClient(QObject):
             self.failed.emit(operation, code, message)
         elif network_error == QNetworkReply.NetworkError.SslHandshakeFailedError:
             self.failed.emit(operation, "network_error", "加密连接校验失败，请检查主机地址和证书。")
+        elif network_error in (
+            QNetworkReply.NetworkError.ConnectionRefusedError, QNetworkReply.NetworkError.HostNotFoundError,
+            QNetworkReply.NetworkError.TimeoutError, QNetworkReply.NetworkError.RemoteHostClosedError,
+            QNetworkReply.NetworkError.TemporaryNetworkFailureError,
+        ):
+            self.failed.emit(operation, "host_unreachable", "无法连接主机，请检查地址或监听状态。")
         else:
             self.failed.emit(operation, "network_error", "无法连接主机，请检查地址、监听状态或稍后重试。")

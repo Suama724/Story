@@ -1,15 +1,26 @@
 """角色登录、登录记忆与大厅中的密码修改。"""
 
+from pathlib import Path
+
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QCloseEvent
+from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QInputDialog, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .auth_client import AuthClient, ClientSession, server_urls
+from .history_cache import HistoryCache
 from .lobby_window import DEFAULT_ADDRESS, LobbyWindow
-from .login_history import LoginHistory
+from .login_history import LoginHistory, offline_password_matches
+
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+LOGIN_ERRORS = {
+    "campaign_mismatch": "角色信息错误",
+    "actor_not_found": "角色信息错误",
+    "invalid_credentials": "密码错误",
+}
 
 STYLE = """
 QWidget { color: #203548; font-size: 14px; }
@@ -91,10 +102,11 @@ class PlayerWindow(QWidget):
         self.lobby: LobbyWindow | None = None
         self._busy = False
         self._pending_password = ""
+        self._offline_record: dict | None = None
         self.history = LoginHistory(settings)
         self._http = None
         self._websocket = None
-        self._drafts: dict[tuple[str, str], str] = {}
+        self._drafts: dict[tuple[str, str], tuple[str, tuple[str, str] | None]] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -119,7 +131,7 @@ class PlayerWindow(QWidget):
         self._load_history()
         self._update_controls()
 
-    def _card(self, title: str, hint: str) -> tuple[QWidget, QVBoxLayout]:
+    def _card(self, title: str) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         outer = QVBoxLayout(page)
         outer.addStretch()
@@ -129,13 +141,12 @@ class PlayerWindow(QWidget):
         contents.setContentsMargins(26, 24, 26, 24)
         contents.setSpacing(18)
         contents.addWidget(label(title, "title"))
-        contents.addWidget(label(hint, "muted"))
         outer.addWidget(card)
         outer.addStretch()
         return page, contents
 
     def _login_page(self) -> QWidget:
-        page, layout = self._card("加入一个团", "选择已保存的角色，或填写组织者提供的登录信息。")
+        page, layout = self._card("加入")
         self.saved_logins = QComboBox()
         self.saved_logins.currentIndexChanged.connect(self._select_saved_login)
         self.address = QLineEdit(DEFAULT_ADDRESS)
@@ -158,7 +169,7 @@ class PlayerWindow(QWidget):
         form.addRow("密码", self.password)
         layout.addLayout(form)
         buttons = QHBoxLayout()
-        self.login_button = QPushButton("登录并进入大厅")
+        self.login_button = QPushButton("进入大厅")
         self.login_button.setObjectName("primary")
         self.login_button.clicked.connect(self._login)
         self.password.returnPressed.connect(self._login)
@@ -187,9 +198,44 @@ class PlayerWindow(QWidget):
         self.password.setText(record["password"] if record else "123456")
         self.remember_password.setChecked(record is None or bool(record["password"]))
 
+    def _saved_profile(self) -> dict | None:
+        campaign = self.campaign_name.text().strip()
+        actor = self.actor_name.text().strip().translate(ASCII_LOWER)
+        for record in self.history.entries():
+            if record["campaign_name"] != campaign or record["actor_name"].translate(ASCII_LOWER) != actor:
+                continue
+            try:
+                _, address = server_urls(record["address"])
+            except ValueError:
+                continue
+            if self._websocket == address:
+                return record
+        return None
+
+    def _open_local_history(self, record: dict) -> None:
+        self._http, self._websocket = server_urls(record["address"])
+        self._offline_record = record
+        self.password.clear()
+        self.feedback.setText("正在查看本机已同步的历史。" if self._lobby_identity() else "本机暂无已同步的历史。")
+        self._enter_lobby()
+        self._update_controls()
+
+    def _login_from_history(self) -> None:
+        if self._busy or self._offline_record is None:
+            return
+        record = self._offline_record
+        password = record["password"]
+        if not password:
+            password, accepted = QInputDialog.getText(self, "重新连接", "角色密码", QLineEdit.EchoMode.Password)
+            if not accepted or not 1 <= len(password) <= 256:
+                return
+        self.password.setText(password)
+        self._request("login", {"campaign_name": record["campaign_name"],
+                                "actor_name": record["actor_name"], "password": password})
+
     def _save_login(self, password: str) -> None:
-        remembered = password if self.remember_password.isChecked() else ""
-        if not self.history.save(self.session, self._websocket.toString(), remembered):
+        if not self.history.save(self.session, self._websocket.toString(), password,
+                                 remember=self.remember_password.isChecked()):
             self.feedback.setText("角色记忆保存失败，请检查应用数据目录的写入权限。")
 
     def _login(self) -> None:
@@ -201,12 +247,9 @@ class PlayerWindow(QWidget):
             self.feedback.setText(str(error))
             return
         campaign_name = self.campaign_name.text().strip()
-        if not campaign_name:
-            self.feedback.setText("请填写团名。")
-            return
         actor_name, password = self.actor_name.text().strip(), self.password.text()
-        if not 1 <= len(actor_name) <= 80 or not 1 <= len(password) <= 256:
-            self.feedback.setText("请填写角色名和密码。角色名最多 80 个字符，密码最多 256 个字符。")
+        if not campaign_name or not 1 <= len(actor_name) <= 80:
+            self.feedback.setText("角色信息错误")
             return
         self._request("login", {"campaign_name": campaign_name, "actor_name": actor_name, "password": password})
 
@@ -217,7 +260,7 @@ class PlayerWindow(QWidget):
         self.auth.request(self._http, operation, body, self.session.token if self.session else "")
 
     def _change_password(self) -> None:
-        if self._busy or self.session is None:
+        if self._busy or not self.change_button.isEnabled():
             return
         session = self.session
         dialog = PasswordDialog(self)
@@ -236,13 +279,27 @@ class PlayerWindow(QWidget):
         self.feedback.setText("")
         if operation == "login":
             try:
-                self.session = ClientSession.from_response(response)
+                session = ClientSession.from_response(response)
             except ValueError as error:
-                self._reset_login(str(error))
+                self.feedback.setText(str(error))
+                self._update_controls()
                 return
+            if self._offline_record is not None:
+                identity = self._lobby_identity()
+                if identity is not None and (session.campaign_id, session.member_id) != identity:
+                    self.feedback.setText("主机上的团或角色已变更，请返回登录页重新选择。")
+                    self.password.clear()
+                    self._update_controls()
+                    return
+            self.session = session
             self._save_login(self.password.text())
             self.password.clear()
-            self._enter_lobby()
+            if self._offline_record is not None:
+                self._offline_record = None
+                self._show_lobby_identity(session.campaign_name, session.actor_name)
+                self.lobby.resume(session, self._history_cache((session.campaign_id, session.member_id)))
+            else:
+                self._enter_lobby()
         elif operation == "password":
             if response.get("changed") is True:
                 self.feedback.setText("密码已更新。")
@@ -259,7 +316,11 @@ class PlayerWindow(QWidget):
     def _auth_failed(self, operation: str, code: str, message: str) -> None:
         self._busy = False
         self._pending_password = ""
-        if operation == "logout":
+        if operation == "login":
+            self._login_failed(code, message)
+        elif operation == "session" and code == "host_unreachable":
+            self.feedback.setText("主机未连接，正在显示本地历史。")
+        elif operation == "logout":
             message = "已退出登录。" if code == "invalid_session" else "已清除本机登录，主机未确认退出。"
             self._reset_login(message)
         elif code == "invalid_session":
@@ -268,22 +329,70 @@ class PlayerWindow(QWidget):
             self.feedback.setText(message)
         self._update_controls()
 
+    def _login_failed(self, code: str, message: str) -> None:
+        password = self.password.text()
+        if code == "host_unreachable" and self._offline_record is None:
+            record = self._saved_profile()
+            if record is None:
+                self.feedback.setText("角色信息错误")
+            elif not offline_password_matches(record, password):
+                self.feedback.setText("密码错误")
+            else:
+                self._open_local_history(record)
+            return
+
+        if code == "invalid_credentials":
+            record = self._offline_record or self._saved_profile()
+            if record is not None:
+                self.history.forget_rejected_password(record, password)
+            if self._offline_record is not None:
+                self._offline_record["password"] = ""
+        if self._offline_record is not None:
+            self.password.clear()
+        self.feedback.setText(LOGIN_ERRORS.get(code, message))
+
+    def _lobby_identity(self) -> tuple[str, str] | None:
+        if self.session is not None:
+            return self.session.campaign_id, self.session.member_id
+        if self._offline_record is not None:
+            campaign, member = self._offline_record.get("campaign_id"), self._offline_record.get("member_id")
+            if isinstance(campaign, str) and campaign and isinstance(member, str) and member:
+                return campaign, member
+        return None
+
+    def _history_cache(self, identity: tuple[str, str]) -> HistoryCache:
+        return HistoryCache(Path(self.history.settings.fileName()).with_name("history.sqlite3"), *identity)
+
     def _enter_lobby(self) -> None:
-        self.lobby = LobbyWindow(session=self.session, address=self._websocket.toString())
+        profile = self._offline_record
+        campaign_name = self.session.campaign_name if self.session is not None else profile["campaign_name"]
+        actor_name = self.session.actor_name if self.session is not None else profile["actor_name"]
+        key = self._lobby_identity()
+        cache = self._history_cache(key) if key is not None else None
+        self.lobby = LobbyWindow(session=self.session, address=self._websocket.toString(), cache=cache,
+                                 offline_actor=actor_name)
+        self.lobby.loginRequested.connect(self._login_from_history)
         self.lobby.sessionRejected.connect(self._session_rejected)
         self.lobby.sessionCheckRequested.connect(self._check_session)
-        key = (self._http.toString(), self.session.member_id)
-        self.lobby.message.setPlainText(self._drafts.pop(key, ""))
+        self.lobby.socket.stateChanged.connect(self._update_controls)
+        if key is not None:
+            draft, self.lobby.retry_send = self._drafts.pop(key, ("", None))
+            self.lobby.message.setPlainText(draft)
         self.pages.addWidget(self.lobby)
         self.pages.setCurrentWidget(self.lobby)
-        self.identity.setText(f"[{self.session.campaign_name}]-{self.session.actor_name}")
-        self.setWindowTitle(f"Story · {self.session.actor_name}")
-        QTimer.singleShot(0, self.lobby._open_connection)
+        self._show_lobby_identity(campaign_name, actor_name)
+        if self.session is not None:
+            QTimer.singleShot(0, self.lobby._open_connection)
+
+    def _show_lobby_identity(self, campaign_name: str, actor_name: str) -> None:
+        self.identity.setText(f"[{campaign_name}]-{actor_name}")
+        self.setWindowTitle(f"Story · {actor_name}")
 
     def _leave_lobby(self) -> None:
         if self.lobby is not None:
-            key = (self._http.toString(), self.session.member_id)
-            self._drafts[key] = self.lobby.message.toPlainText()
+            key = self._lobby_identity()
+            if key is not None:
+                self._drafts[key] = (self.lobby.message.toPlainText(), self.lobby.retry_send)
             self.lobby._close_connection()
             self.pages.removeWidget(self.lobby)
             self.lobby.deleteLater()
@@ -293,6 +402,7 @@ class PlayerWindow(QWidget):
         self.auth.cancel()
         self._leave_lobby()
         self.session = None
+        self._offline_record = None
         self._busy = False
         self._pending_password = ""
         self._load_history()
@@ -310,7 +420,12 @@ class PlayerWindow(QWidget):
             self._request("session")
 
     def _logout(self) -> None:
-        if self._busy or self.session is None:
+        if self._busy:
+            return
+        if self._offline_record is not None:
+            self._reset_login("")
+            return
+        if self.session is None:
             return
         self._leave_lobby()
         self.pages.setCurrentIndex(0)
@@ -324,8 +439,11 @@ class PlayerWindow(QWidget):
             field.setEnabled(not self._busy)
         for button in (self.login_button, self.change_button, self.logout_button):
             button.setEnabled(not self._busy)
-        self.change_button.setVisible(self.session is not None and self.lobby is not None)
-        self.logout_button.setVisible(self.session is not None)
+        online = self.lobby is not None and self.lobby.socket.state() == QAbstractSocket.SocketState.ConnectedState
+        self.change_button.setEnabled(online and not self._busy)
+        self.change_button.setVisible(online)
+        self.logout_button.setText("返回登录" if self._offline_record is not None else "退出登录")
+        self.logout_button.setVisible(self.lobby is not None or self.session is not None)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.auth.cancel()

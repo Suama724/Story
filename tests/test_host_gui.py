@@ -18,6 +18,7 @@ from websockets.asyncio.client import connect
 from host.auth import AuthService, DEFAULT_PASSWORD
 from host.host_window import HostWindow
 from host.management import add_member, campaign_details, discover_campaigns, edit_member
+from host.storage import open_campaign
 
 
 class HostGuiTests(unittest.TestCase):
@@ -111,8 +112,9 @@ class HostGuiTests(unittest.TestCase):
         with build_opener(ProxyHandler({})).open(f"http://127.0.0.1:{port}/health", timeout=5) as response:
             self.assertEqual(response.status, 200)
         self.assertTrue(self.window.add_button.isEnabled())
+        second_payload = json.dumps({"type": "chat.send", "request_id": "after-rename", "text": "改名后发言"})
 
-        async def chat() -> None:
+        async def chat() -> dict:
             async with connect(f"ws://127.0.0.1:{port}/ws/lobby", additional_headers={
                 "Authorization": f"Bearer {ready['token']}"
             }, proxy=None) as websocket:
@@ -120,8 +122,11 @@ class HostGuiTests(unittest.TestCase):
                 received = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
                 self.assertEqual(received["nickname"], "调查员甲")
                 edit_member(campaign["directory"], player, "角色改名")
-                await websocket.send(json.dumps({"type": "chat.send", "text": "改名后发言"}))
+                await websocket.send(second_payload)
+                second_ack = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                self.assertEqual(second_ack["type"], "chat.ack")
                 received = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+                self.assertEqual(received, second_ack["message"])
                 self.assertEqual(received["nickname"], "角色改名")
                 self.window.message_input.setPlainText("主持人调试消息")
                 self.window.send_button.click()
@@ -136,12 +141,15 @@ class HostGuiTests(unittest.TestCase):
                 )
                 with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
                     self.assertEqual(json.load(response), {"changed": True})
+                return second_ack
 
-        asyncio.run(chat())
+        original_ack = asyncio.run(chat())
         self.wait_until(lambda: "调查员甲离开了" in self.window.logs.toPlainText())
         logs = self.window.logs.toPlainText().splitlines()
         self.assertEqual(logs[-2:], ["调查员甲加入了", "调查员甲离开了"])
         self.wait_until(lambda: "主持人调试消息" in self.window.messages.toPlainText())
+        self.wait_until(lambda: not self.window.message_input.toPlainText())
+        self.assertEqual(self.window.messages.toPlainText().count("主持人调试消息"), 1)
         self.wait_until(lambda: self.window.member_table.item(1, 2).text() == "654321")
         for _ in range(2):
             self.window.network_button.click()
@@ -150,6 +158,20 @@ class HostGuiTests(unittest.TestCase):
             self.assertEqual(campaign_details(campaign["directory"])["campaign_id"], campaign["campaign_id"])
             self.window.network_button.click()
             self.wait_until(lambda: self.window.server.state == "running")
+
+        async def retry_after_restart() -> None:
+            async with connect(f"ws://127.0.0.1:{port}/ws/lobby", additional_headers={
+                "Authorization": f"Bearer {ready['token']}"
+            }, proxy=None) as websocket:
+                await websocket.send(second_payload)
+                self.assertEqual(json.loads(await asyncio.wait_for(websocket.recv(), timeout=5)), original_ack)
+
+        asyncio.run(retry_after_restart())
+        with open_campaign(campaign["directory"]) as connection:
+            rows = connection.execute("SELECT sequence, nickname, text FROM messages ORDER BY sequence").fetchall()
+            self.assertEqual([tuple(row) for row in rows], [
+                (1, "调查员甲", "来自玩家 🎲"), (2, "角色改名", "改名后发言"), (3, "KP", "主持人调试消息"),
+            ])
 
     def test_occupied_port_preserves_existing_listener(self) -> None:
         self.create_from_form()

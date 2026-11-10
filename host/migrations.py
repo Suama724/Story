@@ -3,7 +3,7 @@
 import sqlite3
 
 APPLICATION_ID = 0x53545259  # STRY
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _unique_character_names(connection: sqlite3.Connection) -> None:
@@ -116,6 +116,22 @@ MIGRATIONS = (
         _unique_character_names,
         """CREATE UNIQUE INDEX unique_character_name ON actors(name COLLATE NOCASE)
            WHERE kind IN ('kp', 'pc')""",
+    ),
+    (
+        """CREATE TABLE messages (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            channel_id TEXT NOT NULL REFERENCES channels(id),
+            sequence INTEGER NOT NULL CHECK (sequence > 0),
+            member_id TEXT NOT NULL REFERENCES members(id),
+            actor_id TEXT NOT NULL REFERENCES actors(id),
+            nickname TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (channel_id, sequence),
+            UNIQUE (member_id, request_id)
+        )""",
     ),
 )
 
