@@ -11,6 +11,8 @@ CHAT_ERROR = "chat.error"
 CHAT_HISTORY_GET = "chat.history.get"
 CHAT_HISTORY = "chat.history"
 HISTORY_PAGE_SIZE = 50
+PING_INTERVAL_SECONDS = 20
+PONG_TIMEOUT_SECONDS = 10
 MAX_TEXT_LENGTH = 2_000
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 

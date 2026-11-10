@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import uvicorn
 
+from chat_protocol import PING_INTERVAL_SECONDS, PONG_TIMEOUT_SECONDS
+
 from .app import create_app
 
 
@@ -25,7 +27,8 @@ async def run_server(directory: Path, host: str, port: int) -> int:
     )
     server = uvicorn.Server(uvicorn.Config(
         application, host=host, port=port, log_level="warning",
-        access_log=False, ws="websockets-sansio", timeout_graceful_shutdown=2,
+        access_log=False, ws="websockets-sansio", ws_ping_interval=PING_INTERVAL_SECONDS,
+        ws_ping_timeout=PONG_TIMEOUT_SECONDS, timeout_graceful_shutdown=2,
     ))
     listener = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
     try:

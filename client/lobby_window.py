@@ -25,18 +25,23 @@ from chat_protocol import (
     CHAT_SEND,
     HISTORY_PAGE_SIZE,
     LOBBY_PATH,
+    PING_INTERVAL_SECONDS,
+    PONG_TIMEOUT_SECONDS,
     SEND_ERRORS,
     chat_text_error,
     decode_event,
 )
 
-from .auth_client import ClientSession
+from .auth_client import AuthClient, ClientSession, server_urls
 from .chat_history import ChatHistory
 from .history_cache import HistoryCache, is_saved_message
 
 SocketState = QAbstractSocket.SocketState
 
 DEFAULT_ADDRESS = f"ws://127.0.0.1:8000{LOBBY_PATH}"
+CONNECT_TIMEOUT_MS = 10_000
+# 在约两分钟的短时断网后仍有机会自动恢复，单次等待最多 30 秒。
+RECONNECT_DELAYS_MS = (1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000)
 STATE_LABELS = {
     SocketState.HostLookupState: "正在解析主机地址…",
     SocketState.ConnectingState: "正在连接…",
@@ -50,7 +55,6 @@ class LobbyWindow(QWidget):
     """单大厅聊天窗口。"""
 
     sessionRejected = Signal()
-    sessionCheckRequested = Signal()
     loginRequested = Signal()
 
     def __init__(self, *, session: ClientSession | None = None, address: str = DEFAULT_ADDRESS,
@@ -60,10 +64,26 @@ class LobbyWindow(QWidget):
         self._managed = session is not None or bool(offline_actor)
         self._cache = cache
         self._history_request: tuple[str, int] | None = None
+        self._live_during_sync: list[dict] | None = None
         self._history_timer = QTimer(self)
         self._history_timer.setSingleShot(True)
         self._history_timer.timeout.connect(self._history_timed_out)
-        self._manual_disconnect = False
+        self._connection_active = False
+        self._opening = False
+        self._connect_timer = QTimer(self)
+        self._connect_timer.setSingleShot(True)
+        self._connect_timer.timeout.connect(self._connection_timed_out)
+        self._retry_count = 0
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._connect_socket)
+        self._ping_payload: bytes | None = None
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setSingleShot(True)
+        self._heartbeat_timer.timeout.connect(self._heartbeat)
+        self._session_check = AuthClient(self) if self._managed else None
+        if self._session_check is not None:
+            self._session_check.failed.connect(self._session_check_failed)
         self.setWindowTitle("Story · 大厅")
         self.resize(640, 440)
 
@@ -140,16 +160,20 @@ class LobbyWindow(QWidget):
         self.socket.connected.connect(self._connected)
         self.socket.textMessageReceived.connect(self._show_message)
         self.socket.errorOccurred.connect(self._show_socket_error)
-        self.socket.disconnected.connect(self._disconnected)
+        self.socket.pong.connect(self._pong_received)
 
     @Slot()
     def _open_connection(self) -> None:
-        if self.socket.state() != SocketState.UnconnectedState:
+        if not self.connect_button.isEnabled():
             return
         if self.session is None and self._managed:
             self.loginRequested.emit()
             return
+        self._retry_count = 0
+        self.feedback.clear()
+        self._connect_socket()
 
+    def _connect_socket(self) -> None:
         address = QUrl(self.address.text().strip(), QUrl.ParsingMode.StrictMode)
         if (
             not address.isValid()
@@ -159,11 +183,11 @@ class LobbyWindow(QWidget):
             self.feedback.setText("地址无效，请输入完整的 WebSocket 地址。")
             return
 
-        self.feedback.clear()
-        self._manual_disconnect = False
         if self.session is not None:
             request = QNetworkRequest(address)
             request.setRawHeader(b"Authorization", f"Bearer {self.session.token}".encode("ascii"))
+            self._connection_active = self._opening = True
+            self._connect_timer.start(CONNECT_TIMEOUT_MS)
             self.socket.open(request)
         else:
             nickname = self.nickname.text().strip()
@@ -179,34 +203,78 @@ class LobbyWindow(QWidget):
 
     @Slot()
     def _close_connection(self) -> None:
-        self._manual_disconnect = True
+        self._connection_active = self._opening = False
+        self._retry_count = 0
+        self._reconnect_timer.stop()
+        self._connect_timer.stop()
+        self._stop_heartbeat()
+        if self._session_check is not None:
+            self._session_check.cancel()
         if self.socket.state() == SocketState.ConnectedState:
             self.socket.close()
         else:
             self.socket.abort()
+        self._update_connection_state(self.socket.state())
+        if self.session is not None and self.retry_send is None:
+            self.feedback.setText("已断开，可以手动重新连接。")
 
-    def _disconnected(self) -> None:
-        if self.session is None or self._manual_disconnect:
+    def _connection_timed_out(self) -> None:
+        self.feedback.setText("连接主机超时。")
+        self.socket.abort()
+
+    def _connection_lost(self) -> None:
+        if not self._connection_active or self.socket.state() != SocketState.UnconnectedState:
             return
-        if self.socket.closeCode() == QWebSocketProtocol.CloseCode.CloseCodePolicyViolated:
+        was_opening = self._opening
+        self._connection_active = self._opening = False
+        self._connect_timer.stop()
+        self._stop_heartbeat()
+        if not was_opening and self.socket.closeCode() == QWebSocketProtocol.CloseCode.CloseCodePolicyViolated:
             self.sessionRejected.emit()
+            return
+        if was_opening:
+            # 被拒绝的 WebSocket 握手没有关闭帧，用 HTTP 区分会话失效和网络故障。
+            http, _ = server_urls(self.address.text())
+            self._session_check.cancel()
+            self._session_check.request(http, "session", token=self.session.token)
+        if self._retry_count < len(RECONNECT_DELAYS_MS):
+            delay = RECONNECT_DELAYS_MS[self._retry_count]
+            self._retry_count += 1
+            self._reconnect_timer.start(delay)
         else:
-            self.sessionCheckRequested.emit()
+            message = "自动重连失败，可以点击「重新连接」再试。"
+            if self.retry_send is not None:
+                message += "未确认的消息已保留。"
+            self.feedback.setText(message)
+        self._update_connection_state(self.socket.state())
+
+    def _session_check_failed(self, _operation: str, code: str, _message: str) -> None:
+        if code == "invalid_session":
+            self.sessionRejected.emit()
 
     def _update_connection_state(self, state: SocketState) -> None:
         connected = state == SocketState.ConnectedState
         idle = state == SocketState.UnconnectedState
 
-        self.connection_status.setText(STATE_LABELS.get(state, "正在连接…"))
+        waiting_to_retry = self._reconnect_timer.isActive()
+        reconnecting = waiting_to_retry or (self._opening and self._retry_count > 0)
+        status = STATE_LABELS.get(state, "正在连接…")
+        if reconnecting:
+            status = f"正在重连（{self._retry_count}/{len(RECONNECT_DELAYS_MS)}）…"
+        self.connection_status.setText(status)
         self.address.setEnabled(idle)
         self.nickname.setEnabled(idle)
-        self.connect_button.setEnabled(idle)
-        self.disconnect_button.setEnabled(not idle and state != SocketState.ClosingState)
+        self.connect_button.setEnabled(idle and not self._connection_active and not waiting_to_retry)
+        self.disconnect_button.setEnabled(waiting_to_retry or (not idle and state != SocketState.ClosingState))
         if not connected:
             self._finish_history_request()
+            self._finish_sync()
         if not connected and self._awaiting_send:
             self._awaiting_send = False
             self.feedback.setText("连接已断开，消息未确认，草稿已保留。")
+        if idle and self._connection_active:
+            # 等待 Qt 更新关闭码，握手失败也可能只发出状态或错误信号。
+            QTimer.singleShot(0, self, self._connection_lost)
 
         self._update_send_controls()
 
@@ -216,14 +284,46 @@ class LobbyWindow(QWidget):
         self.message.setReadOnly(self._awaiting_send or (self._managed and not connected))
 
     def _connected(self) -> None:
+        self._opening = False
+        self._connect_timer.stop()
+        if self.session is not None:
+            self._session_check.cancel()
+            self._heartbeat_timer.start(PING_INTERVAL_SECONDS * 1000)
+            if self.retry_send is not None:
+                self.feedback.setText("草稿已保留，未确认的消息可以手动重发。")
+            elif self._retry_count:
+                self.feedback.setText("连接已恢复。")
+            self._retry_count = 0
+            self._update_connection_state(self.socket.state())
         if self._cache is None:
             self.chat_history.clear()
             return
+        self._live_during_sync = []
         try:
             position = self._cache.position()
         except (OSError, sqlite3.Error):
             position = None
         self._request_history("latest" if position is None else "after", position or 0)
+
+    def _heartbeat(self) -> None:
+        if self.socket.state() != SocketState.ConnectedState:
+            return
+        if self._ping_payload is not None:
+            self.feedback.setText("主机未响应心跳，连接已中断。")
+            self.socket.abort()
+            return
+        self._ping_payload = uuid4().bytes
+        self.socket.ping(self._ping_payload)
+        self._heartbeat_timer.start(PONG_TIMEOUT_SECONDS * 1000)
+
+    def _pong_received(self, _elapsed: int, payload: bytes) -> None:
+        if self._ping_payload is not None and payload == self._ping_payload:
+            self._ping_payload = None
+            self._heartbeat_timer.start(PING_INTERVAL_SECONDS * 1000)
+
+    def _stop_heartbeat(self) -> None:
+        self._heartbeat_timer.stop()
+        self._ping_payload = None
 
     def _show_cached_page(self, before: int | None = None, *, require_contiguous: bool = False) -> bool:
         try:
@@ -250,10 +350,13 @@ class LobbyWindow(QWidget):
 
     def _request_history(self, mode: str, cursor: int) -> None:
         payload = json.dumps({"type": CHAT_HISTORY_GET, "mode": mode, "cursor": cursor})
-        if self.socket.sendTextMessage(payload) > 0:
-            self._history_request = (mode, cursor)
-            self.older_button.setEnabled(False)
-            self._history_timer.start(5000)
+        if self.socket.sendTextMessage(payload) <= 0:
+            self._finish_sync()
+            self.feedback.setText("无法请求主机历史，已保留本地消息。")
+            return
+        self._history_request = (mode, cursor)
+        self.older_button.setEnabled(False)
+        self._history_timer.start(5000)
 
     def _finish_history_request(self) -> None:
         self._history_request = None
@@ -262,6 +365,7 @@ class LobbyWindow(QWidget):
 
     def _history_timed_out(self) -> None:
         self._finish_history_request()
+        self._finish_sync()
         self.feedback.setText("主机未返回历史记录，已保留本地消息。")
 
     def _show_history_page(self, event: dict) -> None:
@@ -272,17 +376,32 @@ class LobbyWindow(QWidget):
         page = event.get("messages")
         if (not isinstance(page, list) or len(page) > HISTORY_PAGE_SIZE
                 or not all(is_saved_message(item) for item in page)):
+            self._finish_sync()
             self.feedback.setText("主机历史读取失败。")
             return
         sequences = [item["sequence"] for item in page]
         if sequences != sorted(set(sequences)) or (mode == "after" and sequences and sequences[0] <= cursor):
+            self._finish_sync()
             self.feedback.setText("主机返回的历史顺序无效。")
             return
         self._show_saved_messages(page, latest=mode == "latest")
         if mode == "after" and page and event.get("has_more") is True:
             self._request_history("after", sequences[-1])
-        elif mode == "before" and not page:
+        elif mode != "before":
+            self._finish_sync()
+        elif not page:
             self.feedback.setText("已到最早的消息。")
+
+    def _finish_sync(self) -> None:
+        messages, self._live_during_sync = self._live_during_sync, None
+        if messages:
+            self._show_saved_messages(messages)
+
+    def _show_live_message(self, message: dict) -> None:
+        if self._live_during_sync is None:
+            self._show_saved_messages([message])
+        else:
+            self._live_during_sync.append(message)
 
     def _show_saved_messages(self, messages: list[dict], *, latest: bool = False) -> None:
         if self._cache is not None:
@@ -334,9 +453,9 @@ class LobbyWindow(QWidget):
             message = event.get("message")
             if self._matches_pending(event) and isinstance(message, dict):
                 self._confirm_send()
-                self._show_saved_messages([message])
+                self._show_live_message(message)
         elif event_type == CHAT_MESSAGE:
-            self._show_saved_messages([event])
+            self._show_live_message(event)
             if "message_id" not in event and event.get("own") is True and self._awaiting_send:
                 self._confirm_send()
         elif event_type == CHAT_HISTORY:
@@ -360,6 +479,8 @@ class LobbyWindow(QWidget):
 
     def _show_socket_error(self, _error: QAbstractSocket.SocketError) -> None:
         self.feedback.setText(f"连接错误：{self.socket.errorString()}")
+        if self._connection_active and self.socket.state() == SocketState.UnconnectedState:
+            QTimer.singleShot(0, self, self._connection_lost)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._close_connection()

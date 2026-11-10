@@ -26,6 +26,7 @@ from host.storage import initialize_campaign
 
 PASSWORD = "我的新密码🎲123456"
 CONNECTED = QAbstractSocket.SocketState.ConnectedState
+UNCONNECTED = QAbstractSocket.SocketState.UnconnectedState
 
 
 class AddressTests(unittest.TestCase):
@@ -268,7 +269,7 @@ class ClientGuiTests(unittest.TestCase):
         with self.assertRaises(AuthError):
             self.service.require_session(token)
 
-    def test_lost_confirmation_keeps_draft_and_reuses_request_after_reconnect(self) -> None:
+    def test_lost_confirmation_keeps_draft_and_reuses_request_after_automatic_reconnect(self) -> None:
         self.ready_player()
         lobby = self.player.lobby
         draft = "停服时的草稿 🎲"
@@ -286,7 +287,6 @@ class ClientGuiTests(unittest.TestCase):
         lobby.socket.textMessageReceived.connect(lobby._show_message)
         self.server.start(self.directory, "127.0.0.1", self.port)
         self.wait_until(lambda: self.server.state == "running")
-        lobby.connect_button.click()
         self.wait_until(lambda: lobby.socket.state() == CONNECTED)
         self.server.command("say", text="重启后的新消息")
         self.wait_until(lambda: "重启后的新消息" in lobby.chat_history.toPlainText())
@@ -297,6 +297,108 @@ class ClientGuiTests(unittest.TestCase):
             f"调查员甲：{draft}", "KP：重启后的新消息",
         ])
         self.assertEqual(sum(event["text"] == draft for event in self.server_messages), 1)
+
+    def test_missing_pong_reconnects_and_keeps_draft(self) -> None:
+        self.ready_player()
+        lobby = self.player.lobby
+        lobby.message.setPlainText("还没写完的调查记录")
+        states = []
+        lobby.socket.stateChanged.connect(states.append)
+        with (
+            patch("client.lobby_window.PING_INTERVAL_SECONDS", 1),
+            patch("client.lobby_window.PONG_TIMEOUT_SECONDS", 1),
+        ):
+            lobby._heartbeat_timer.start(100)
+            pongs = []
+            lobby.socket.pong.connect(lambda _elapsed, payload: pongs.append(payload))
+            self.wait_until(lambda: bool(pongs))
+            self.assertIsNone(lobby._ping_payload)
+            self.assertNotIn(UNCONNECTED, states)
+
+            lobby.socket.pong.disconnect(lobby._pong_received)
+            self.wait_until(lambda: UNCONNECTED in states)
+            lobby.socket.pong.connect(lobby._pong_received)
+            self.wait_until(lambda: lobby.socket.state() == CONNECTED)
+            self.assertEqual(lobby.message.toPlainText(), "还没写完的调查记录")
+            self.assertIsNotNone(self.player.session)
+
+    def test_retries_stop_and_manual_disconnect_cancels_backoff(self) -> None:
+        self.ready_player()
+        lobby = self.player.lobby
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        self.wait_until(lobby._reconnect_timer.isActive)
+        lobby.disconnect_button.click()
+        self.assertFalse(lobby._reconnect_timer.isActive())
+        self.assertTrue(lobby.connect_button.isEnabled())
+
+        with socket.socket() as silent_host:
+            silent_host.bind(("127.0.0.1", self.port))
+            silent_host.listen()
+            with (
+                patch("client.lobby_window.CONNECT_TIMEOUT_MS", 120),
+                patch("client.lobby_window.RECONNECT_DELAYS_MS", (60, 120)),
+            ):
+                lobby.connect_button.click()
+                self.wait_until(lambda: "自动重连失败" in lobby.feedback.text())
+                self.assertEqual(lobby._retry_count, 2)
+                self.assertEqual(lobby.connection_status.text(), "未连接")
+                self.assertTrue(lobby.connect_button.isEnabled())
+                self.assertFalse(lobby._reconnect_timer.isActive())
+
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait_until(lambda: self.server.state == "running")
+        self.assertEqual(lobby.socket.state(), UNCONNECTED)
+        lobby.connect_button.click()
+        self.wait_until(lambda: lobby.socket.state() == CONNECTED)
+
+    def test_session_revoked_while_disconnected_returns_to_login_with_draft(self) -> None:
+        self.ready_player()
+        lobby = self.player.lobby
+        lobby.message.setPlainText("等登录后继续写")
+        token = self.player.session.token
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        self.service.logout(token)
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait_until(lambda: self.player.session is None)
+        self.assertEqual(self.player.pages.currentIndex(), 0)
+        self.assertIn("会话已失效", self.player.feedback.text())
+        self.ready_player()
+        self.assertEqual(self.player.lobby.message.toPlainText(), "等登录后继续写")
+
+    def test_automatic_reconnect_pages_history_and_merges_overlapping_live_message(self) -> None:
+        self.ready_player()
+        lobby = self.player.lobby
+        self.server.command("say", text="掉线前")
+        self.wait_until(lambda: "掉线前" in lobby.chat_history.toPlainText())
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        for number in range(1, 56):
+            save_lobby_message(self.directory, f"gap-{number}", f"漏收 {number:02d}", token=None)
+
+        request_history = lobby._request_history
+        requested = []
+
+        def hold_first_page(mode, cursor):
+            requested.append((mode, cursor))
+            if len(requested) > 1:
+                request_history(mode, cursor)
+
+        with patch.object(lobby, "_request_history", side_effect=hold_first_page):
+            self.server.start(self.directory, "127.0.0.1", self.port)
+            self.wait_until(lambda: bool(requested))
+            self.server.command("say", text="同步时的新线索 🎲")
+            self.wait_until(lambda: bool(lobby._live_during_sync))
+            self.assertNotIn("新线索", lobby.chat_history.toPlainText())
+            request_history(*requested[0])
+            self.wait_until(lambda: lobby._live_during_sync is None)
+
+        self.assertEqual(requested, [("after", 1), ("after", 51)])
+        self.assertEqual(lobby.chat_history.toPlainText().splitlines(), [
+            "KP：掉线前", *(f"KP：漏收 {number:02d}" for number in range(1, 56)), "KP：同步时的新线索 🎲",
+        ])
+        self.assertEqual(lobby._cache.position(), 57)
 
     def test_saved_role_reads_paged_history_offline_and_catches_up_when_reconnected(self) -> None:
         def populate(first, last):

@@ -172,7 +172,8 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
         self.http = f"http://127.0.0.1:{port}"
         self.ws = f"ws://127.0.0.1:{port}/ws/lobby"
         self.server = uvicorn.Server(uvicorn.Config(
-            self.application, log_level="error", lifespan="off", ws="websockets-sansio"
+            self.application, log_level="error", lifespan="off", ws="websockets-sansio",
+            ws_ping_interval=0.5, ws_ping_timeout=1.0,
         ))
         self.server_task = asyncio.create_task(self.server.serve(sockets=[self.listener]))
         async with asyncio.timeout(5):
@@ -212,6 +213,34 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(status, 200, result)
         return result
+
+    async def test_lobby_removes_peer_that_does_not_answer_websocket_ping(self) -> None:
+        session = await self.login()
+        host, port = self.listener.getsockname()
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            writer.write((
+                "GET /ws/lobby HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                f"Authorization: Bearer {session['token']}\r\n\r\n"
+            ).encode("ascii"))
+            await writer.drain()
+            response = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=3)
+            self.assertTrue(response.startswith(b"HTTP/1.1 101"))
+            self.assertEqual(len(self.application.state.lobby.connections), 1)
+
+            # 保持 TCP 打开且不发送 Pong，等待服务端超时关闭。
+            frames = await asyncio.wait_for(reader.read(), timeout=5)
+            self.assertEqual(frames[:1], b"\x89")
+            async with asyncio.timeout(3):
+                while self.application.state.lobby.connections:
+                    await asyncio.sleep(0.01)
+            self.assertEqual(self.player_logs, ["调查员加入了", "调查员离开了"])
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def test_first_login_permissions_and_bound_sender(self) -> None:
         with self.assertRaises(InvalidStatus) as refused:

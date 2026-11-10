@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import (
@@ -309,8 +309,6 @@ class PlayerWindow(QWidget):
             self._pending_password = ""
         elif operation == "logout":
             self._reset_login("已退出登录。")
-        elif operation == "session" and self.lobby and self.lobby.connect_button.isEnabled():
-            self.lobby.feedback.setText("连接已中断，可以点击「重新连接」。")
         self._update_controls()
 
     def _auth_failed(self, operation: str, code: str, message: str) -> None:
@@ -318,8 +316,6 @@ class PlayerWindow(QWidget):
         self._pending_password = ""
         if operation == "login":
             self._login_failed(code, message)
-        elif operation == "session" and code == "host_unreachable":
-            self.feedback.setText("主机未连接，正在显示本地历史。")
         elif operation == "logout":
             message = "已退出登录。" if code == "invalid_session" else "已清除本机登录，主机未确认退出。"
             self._reset_login(message)
@@ -373,7 +369,6 @@ class PlayerWindow(QWidget):
                                  offline_actor=actor_name)
         self.lobby.loginRequested.connect(self._login_from_history)
         self.lobby.sessionRejected.connect(self._session_rejected)
-        self.lobby.sessionCheckRequested.connect(self._check_session)
         self.lobby.socket.stateChanged.connect(self._update_controls)
         if key is not None:
             draft, self.lobby.retry_send = self._drafts.pop(key, ("", None))
@@ -382,7 +377,7 @@ class PlayerWindow(QWidget):
         self.pages.setCurrentWidget(self.lobby)
         self._show_lobby_identity(campaign_name, actor_name)
         if self.session is not None:
-            QTimer.singleShot(0, self.lobby._open_connection)
+            self.lobby._open_connection()
 
     def _show_lobby_identity(self, campaign_name: str, actor_name: str) -> None:
         self.identity.setText(f"[{campaign_name}]-{actor_name}")
@@ -414,10 +409,6 @@ class PlayerWindow(QWidget):
 
     def _session_rejected(self) -> None:
         self._reset_login("会话已失效，请重新登录。未发送的草稿已保留。")
-
-    def _check_session(self) -> None:
-        if self.session is not None and not self._busy:
-            self._request("session")
 
     def _logout(self) -> None:
         if self._busy:
