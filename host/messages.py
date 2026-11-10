@@ -15,18 +15,28 @@ def lobby_history(directory: Path, token: str, mode: str, cursor: int) -> dict[s
     with open_campaign(directory) as connection, connection:
         connection.execute("BEGIN")
         session_for_token(connection, token)
-        channel_id = campaign_info(connection)["lobby_id"]
-        if mode == "after":
-            selection, values = "AND sequence > ? ORDER BY sequence", (cursor,)
-        elif mode == "before":
-            selection, values = "AND sequence < ? ORDER BY sequence DESC", (cursor,)
-        else:
-            selection, values = "ORDER BY sequence DESC", ()
-        rows = connection.execute(
-            f"""SELECT message_id, channel_id, sequence, member_id, actor_id, nickname, kind, text, created_at
-                FROM messages WHERE channel_id = ? {selection} LIMIT ?""",
-            (channel_id, *values, HISTORY_PAGE_SIZE + 1),
-        ).fetchall()
+        return _lobby_page(connection, mode, cursor)
+
+
+def local_lobby_history(directory: Path, *, before: int | None = None) -> dict[str, object]:
+    """组织者工作台直接读取本地团库，监听关闭时也可翻页。"""
+    with open_campaign(directory) as connection:
+        return _lobby_page(connection, "latest" if before is None else "before", before or 0)
+
+
+def _lobby_page(connection: sqlite3.Connection, mode: str, cursor: int) -> dict[str, object]:
+    channel_id = campaign_info(connection)["lobby_id"]
+    if mode == "after":
+        selection, values = "AND sequence > ? ORDER BY sequence", (cursor,)
+    elif mode == "before":
+        selection, values = "AND sequence < ? ORDER BY sequence DESC", (cursor,)
+    else:
+        selection, values = "ORDER BY sequence DESC", ()
+    rows = connection.execute(
+        f"""SELECT message_id, channel_id, sequence, member_id, actor_id, nickname, kind, text, created_at
+            FROM messages WHERE channel_id = ? {selection} LIMIT ?""",
+        (channel_id, *values, HISTORY_PAGE_SIZE + 1),
+    ).fetchall()
     page = rows[:HISTORY_PAGE_SIZE]
     if mode != "after":
         page.reverse()

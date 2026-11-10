@@ -1,4 +1,4 @@
-"""用 python -m host 管理本地团和角色。"""
+"""Story 桌面入口与本地团管理命令。"""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ from .storage import campaign_info, initialize_campaign, open_campaign
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Story 主机团数据管理")
+    parser = argparse.ArgumentParser(description="Story 桌面应用与主机团数据管理")
     commands = parser.add_subparsers(dest="command")
 
     gui = commands.add_parser("gui", help="打开主机管理窗口")
@@ -38,11 +38,14 @@ def main(argv: list[str] | None = None) -> int:
         action.add_argument("directory", type=Path, help="包含 story.sqlite3 的团目录")
 
     arguments = parser.parse_args(argv)
-    if arguments.command in (None, "gui"):
+    if arguments.command is None:
+        from client.__main__ import main as desktop_main
+
+        return desktop_main([])
+    if arguments.command == "gui":
         from .host_window import run_gui
 
-        root = getattr(arguments, "data_root", Path(__file__).resolve().parents[1] / "data")
-        return run_gui(root)
+        return run_gui(arguments.data_root)
     if arguments.command == "serve":
         import asyncio
 

@@ -20,6 +20,7 @@ from chat_protocol import chat_text_error
 from client.chat_history import ChatHistory
 
 from .management import add_member, campaign_details, discover_campaigns, edit_member
+from .messages import local_lobby_history
 from .server_controller import ServerController
 from .storage import initialize_campaign, member_name
 
@@ -125,6 +126,7 @@ class HostWindow(QMainWindow):
         self._closing = False
         self._returning = False
         self._refresh_pending = False
+        self._history_has_more = False
         self._pending_send: str | None = None
         self._retry_send: tuple[str, str] | None = None
         self.server = ServerController(self)
@@ -299,13 +301,18 @@ class HostWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.messages = ChatHistory()
         self.server.messageReceived.connect(self.messages.add_message)
-        self.messages.setMaximumBlockCount(2000)
-        self.messages.setPlaceholderText("本次运行的消息将在这里显示。")
+        self.messages.setPlaceholderText("暂无大厅消息。")
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+        self.older_button = QPushButton("查看更早消息")
+        self.older_button.clicked.connect(self._load_older_history)
+        history_layout.addWidget(self.older_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        history_layout.addWidget(self.messages, 1)
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(1000)
         self.logs.setFont(QFont("Consolas", 10))
-        self.tabs.addTab(self.messages, "大厅消息")
+        self.tabs.addTab(history_tab, "大厅消息")
         self.tabs.addTab(self.logs, "运行日志")
         channel_layout.addWidget(self.tabs, 1)
         self.message_input = QPlainTextEdit()
@@ -391,19 +398,24 @@ class HostWindow(QMainWindow):
         item = self.campaign_list.currentItem()
         if item is not None and not self._busy:
             directory = item.data(Qt.ItemDataRole.UserRole)
-            self._run(lambda: campaign_details(directory), self._enter_campaign)
+            self._run(lambda: self._read_campaign(directory), self._enter_campaign)
 
     def _create_campaign(self) -> None:
         name = self.new_name.text()
         description = self.new_description.toPlainText()
 
-        def create() -> dict:
+        def create() -> tuple[dict, dict]:
             directory = initialize_campaign(self.data_root, name, description=description)
-            return campaign_details(directory)
+            return self._read_campaign(directory)
 
         self._run(create, self._enter_campaign)
 
-    def _enter_campaign(self, campaign: dict) -> None:
+    @staticmethod
+    def _read_campaign(directory: Path) -> tuple[dict, dict]:
+        return campaign_details(directory), local_lobby_history(directory)
+
+    def _enter_campaign(self, result: tuple[dict, dict]) -> None:
+        campaign, history = result
         self.campaign = campaign
         self.campaign_title.setText(str(campaign["name"]))
         self.campaign_title.setToolTip(str(campaign["directory"]))
@@ -413,10 +425,21 @@ class HostWindow(QMainWindow):
         self.campaign_description.setVisible(bool(description))
         self.header_state.setText("本地管理 · 监听已关闭")
         self.messages.clear()
+        self._show_history(history)
         self._retry_send = None
         self.message_input.clear()
         self.pages.setCurrentIndex(1)
         self._populate_members()
+
+    def _show_history(self, page: dict) -> None:
+        self.messages.add_messages(page["messages"])
+        self._history_has_more = page["has_more"]
+
+    def _load_older_history(self) -> None:
+        before = self.messages.oldest_sequence
+        if self.campaign is not None and self._history_has_more and before is not None:
+            directory = self.campaign["directory"]
+            self._run(lambda: local_lobby_history(directory, before=before), self._show_history)
 
     def _populate_members(self) -> None:
         selected = self._selected_member()
@@ -575,6 +598,7 @@ class HostWindow(QMainWindow):
         self.browse_button.setEnabled(available)
         self.refresh_button.setEnabled(available)
         self.switch_button.setEnabled(available and not self._returning)
+        self.older_button.setEnabled(available and self.campaign is not None and self._history_has_more and not self._returning)
         self.add_button.setEnabled(available)
         self.members_refresh.setEnabled(available)
         selected = self._selected_member()

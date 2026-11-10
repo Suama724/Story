@@ -15,9 +15,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 from websockets.asyncio.client import connect
 
+from chat_protocol import HISTORY_PAGE_SIZE
 from host.auth import AuthService, DEFAULT_PASSWORD
 from host.host_window import HostWindow
 from host.management import add_member, campaign_details, discover_campaigns, edit_member
+from host.messages import save_lobby_message
 from host.storage import open_campaign
 
 
@@ -102,6 +104,35 @@ class HostGuiTests(unittest.TestCase):
         self.assertEqual(self.window.pages.currentIndex(), 0)
         self.assertEqual(discover_campaigns(self.root)[0], [])
 
+    def test_reopen_campaign_and_page_older_history_without_listening(self) -> None:
+        campaign = self.create_from_form()
+        self.assertFalse(self.window.older_button.isEnabled())
+        total = HISTORY_PAGE_SIZE * 2 + 1
+        for sequence in range(1, total + 1):
+            save_lobby_message(campaign["directory"], f"seed-{sequence}", f"历史 {sequence:03d}", token=None)
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertFalse(self.window.server.active)
+        for count in (HISTORY_PAGE_SIZE, HISTORY_PAGE_SIZE * 2):
+            self.assertEqual(self.window.messages.toPlainText().splitlines(), [
+                f"KP：历史 {sequence:03d}" for sequence in range(total - count + 1, total + 1)
+            ])
+            self.assertTrue(self.window.older_button.isEnabled())
+            self.window.older_button.click()
+            self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window.messages.toPlainText().splitlines(), [
+            f"KP：历史 {sequence:03d}" for sequence in range(1, total + 1)
+        ])
+        self.assertFalse(self.window.older_button.isEnabled())
+
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        other = self.create_from_form()
+        self.assertNotEqual(other["campaign_id"], campaign["campaign_id"])
+        self.assertEqual(self.window.messages.toPlainText(), "")
+
     def test_start_stop_restart_and_live_member_edit(self) -> None:
         campaign = self.create_from_form()
         player = add_member(campaign["directory"], "调查员甲")
@@ -172,6 +203,15 @@ class HostGuiTests(unittest.TestCase):
             self.assertEqual([tuple(row) for row in rows], [
                 (1, "调查员甲", "来自玩家 🎲"), (2, "角色改名", "改名后发言"), (3, "KP", "主持人调试消息"),
             ])
+        self.window.server.stop()
+        self.wait_until(lambda: not self.window.server.active)
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window.messages.toPlainText().splitlines(), [
+            "调查员甲：来自玩家 🎲", "角色改名：改名后发言", "KP：主持人调试消息",
+        ])
 
     def test_occupied_port_preserves_existing_listener(self) -> None:
         self.create_from_form()
