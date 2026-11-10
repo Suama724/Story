@@ -3,7 +3,31 @@
 import sqlite3
 
 APPLICATION_ID = 0x53545259  # STRY
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+
+
+def _unique_character_names(connection: sqlite3.Connection) -> None:
+    duplicates = connection.execute(
+        """SELECT id, name FROM (
+               SELECT id, name, row_number() OVER (
+                   PARTITION BY name COLLATE NOCASE ORDER BY kind = 'kp' DESC, rowid
+               ) AS position
+               FROM actors WHERE kind IN ('kp', 'pc')
+           ) WHERE position > 1"""
+    ).fetchall()
+    for actor_id, name in duplicates:
+        number = 2
+        while True:
+            suffix = f"（{number}）"
+            candidate = name[:80 - len(suffix)] + suffix
+            exists = connection.execute(
+                "SELECT 1 FROM actors WHERE kind IN ('kp', 'pc') AND name = ? COLLATE NOCASE",
+                (candidate,),
+            ).fetchone()
+            if exists is None:
+                break
+            number += 1
+        connection.execute("UPDATE actors SET name = ? WHERE id = ?", (candidate, actor_id))
 
 MIGRATIONS = (
     (
@@ -51,6 +75,48 @@ MIGRATIONS = (
             created_at TEXT NOT NULL
         )""",
     ),
+    (
+        """CREATE TABLE credentials (
+            member_id TEXT PRIMARY KEY NOT NULL REFERENCES members(id),
+            password_hash TEXT NOT NULL,
+            must_change_password INTEGER NOT NULL CHECK (must_change_password IN (0, 1)),
+            initial_expires_at REAL,
+            CHECK ((must_change_password = 1 AND initial_expires_at IS NOT NULL)
+                OR (must_change_password = 0 AND initial_expires_at IS NULL))
+        )""",
+        """CREATE TABLE auth_sessions (
+            token_hash TEXT PRIMARY KEY NOT NULL,
+            member_id TEXT NOT NULL UNIQUE REFERENCES credentials(member_id),
+            expires_at REAL NOT NULL
+        )""",
+    ),
+    (
+        "ALTER TABLE campaigns ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE auth_sessions RENAME TO legacy_auth_sessions",
+        "ALTER TABLE credentials RENAME TO legacy_credentials",
+        """CREATE TABLE credentials (
+            member_id TEXT PRIMARY KEY NOT NULL REFERENCES members(id),
+            password TEXT,
+            password_hash TEXT,
+            CHECK ((password IS NULL) != (password_hash IS NULL))
+        )""",
+        """INSERT INTO credentials (member_id, password_hash)
+           SELECT member_id, password_hash FROM legacy_credentials WHERE must_change_password = 0""",
+        """CREATE TABLE auth_sessions (
+            token_hash TEXT PRIMARY KEY NOT NULL,
+            member_id TEXT NOT NULL UNIQUE REFERENCES members(id),
+            expires_at REAL NOT NULL
+        )""",
+        """INSERT INTO auth_sessions
+           SELECT s.token_hash, s.member_id, s.expires_at FROM legacy_auth_sessions AS s
+           JOIN credentials AS c ON c.member_id = s.member_id
+           JOIN members AS m ON m.id = s.member_id AND m.role = 'pl'""",
+        "DROP TABLE legacy_auth_sessions",
+        "DROP TABLE legacy_credentials",
+        _unique_character_names,
+        """CREATE UNIQUE INDEX unique_character_name ON actors(name COLLATE NOCASE)
+           WHERE kind IN ('kp', 'pc')""",
+    ),
 )
 
 
@@ -69,7 +135,10 @@ def migrate(connection: sqlite3.Connection) -> None:
 
     for index in range(version, SCHEMA_VERSION):
         # executescript 会隐式提交，因此逐条执行以保留调用方事务。
-        for statement in MIGRATIONS[index]:
-            connection.execute(statement)
+        for step in MIGRATIONS[index]:
+            if isinstance(step, str):
+                connection.execute(step)
+            else:
+                step(connection)
         connection.execute(f"PRAGMA user_version = {index + 1}")
     connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")

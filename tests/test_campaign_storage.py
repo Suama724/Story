@@ -35,13 +35,14 @@ class CampaignStorageTests(unittest.TestCase):
         )
 
     def test_cli_initializes_and_reopens_with_stable_ids(self) -> None:
-        result = self.run_cli("init", str(self.root), "--name", "地下室 🎲", "--kp-name", "主持人")
+        result = self.run_cli("init", str(self.root), "--name", "地下室 🎲", "--description", "测试简介")
         self.assertEqual(result.returncode, 0, result.stderr)
         original = json.loads(result.stdout)
         directory = Path(original["directory"])
         self.assertEqual(directory.name, original["campaign_id"])
         self.assertEqual(original["name"], "地下室 🎲")
-        self.assertEqual(original["kp_name"], "主持人")
+        self.assertEqual(original["kp_name"], "KP")
+        self.assertEqual(original["description"], "测试简介")
         self.assertEqual(original["schema_version"], migrations.SCHEMA_VERSION)
         for command in ("show", "migrate", "show"):
             reopened = self.run_cli(command, str(directory))
@@ -56,8 +57,8 @@ class CampaignStorageTests(unittest.TestCase):
                 connection.execute("UPDATE actors SET member_id = 'missing'")
 
     def test_different_campaigns_have_independent_ids(self) -> None:
-        first = initialize_campaign(self.root, "同名团", "KP")
-        second = initialize_campaign(self.root, "同名团", "KP")
+        first = initialize_campaign(self.root, "同名团")
+        second = initialize_campaign(self.root, "同名团")
         self.assertNotEqual(first, second)
         with open_campaign(first) as connection:
             first_info = campaign_info(connection)
@@ -73,26 +74,25 @@ class CampaignStorageTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
 
     def test_blank_names_do_not_create_directories(self) -> None:
-        for name, kp_name in (("  ", "KP"), ("团", "\n")):
-            with self.assertRaises(ValueError):
-                initialize_campaign(self.root, name, kp_name)
+        with self.assertRaises(ValueError):
+            initialize_campaign(self.root, "  ")
         self.assertFalse(self.root.exists())
 
     def test_initialization_failure_rolls_back_and_cleans_new_directory(self) -> None:
         # 在建表后、写完初始化数据前模拟数据库失败。
         broken = (*migrations.MIGRATIONS[0],
                   "CREATE TRIGGER reject_actor BEFORE INSERT ON actors BEGIN SELECT RAISE(ABORT, 'test'); END")
-        with patch.object(migrations, "MIGRATIONS", (broken,)):
+        with patch.object(migrations, "MIGRATIONS", (broken, *migrations.MIGRATIONS[1:])):
             with self.assertRaises(sqlite3.IntegrityError):
-                initialize_campaign(self.root, "测试团", "KP")
+                initialize_campaign(self.root, "测试团")
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_failed_upgrade_preserves_data_and_version(self) -> None:
-        directory = initialize_campaign(self.root, "团", "KP")
+        directory = initialize_campaign(self.root, "团")
         with open_campaign(directory) as connection:
             original = campaign_info(connection)
         upgrade = ("ALTER TABLE campaigns ADD COLUMN extra TEXT", "INVALID SQL")
-        with patch.object(migrations, "SCHEMA_VERSION", 2), patch.object(
+        with patch.object(migrations, "SCHEMA_VERSION", migrations.SCHEMA_VERSION + 1), patch.object(
             migrations, "MIGRATIONS", (*migrations.MIGRATIONS, upgrade)
         ):
             with self.assertRaises(sqlite3.OperationalError):
@@ -110,7 +110,7 @@ class CampaignStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不是 Story"):
             with open_campaign(self.root):
                 pass
-        directory = initialize_campaign(self.root, "团", "KP")
+        directory = initialize_campaign(self.root, "团")
         with closing(sqlite3.connect(directory / DATABASE_NAME)) as connection:
             connection.execute("PRAGMA user_version = 999")
         result = self.run_cli("migrate", str(directory))
@@ -120,19 +120,20 @@ class CampaignStorageTests(unittest.TestCase):
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 999)
 
     def test_concurrent_upgrade_applies_migration_once(self) -> None:
-        directory = initialize_campaign(self.root, "团", "KP")
+        directory = initialize_campaign(self.root, "团")
         upgrade = ("ALTER TABLE campaigns ADD COLUMN extra TEXT",)
 
         def reopen() -> int:
             with open_campaign(directory) as connection:
                 return campaign_info(connection)["schema_version"]
 
-        with patch.object(migrations, "SCHEMA_VERSION", 2), patch.object(
+        version = migrations.SCHEMA_VERSION + 1
+        with patch.object(migrations, "SCHEMA_VERSION", version), patch.object(
             migrations, "MIGRATIONS", (*migrations.MIGRATIONS, upgrade)
         ):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [executor.submit(reopen) for _ in range(2)]
-                self.assertEqual([future.result() for future in futures], [2, 2])
+                self.assertEqual([future.result() for future in futures], [version, version])
 
 
 if __name__ == "__main__":

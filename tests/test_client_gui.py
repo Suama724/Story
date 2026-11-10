@@ -1,0 +1,260 @@
+"""真实 Qt 角色登录、改密与聊天的验收。"""
+
+import json
+import os
+import socket
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtNetwork import QAbstractSocket
+from PySide6.QtWidgets import QApplication
+
+from client.auth_client import ClientSession, server_urls
+from client.player_window import PasswordDialog, PlayerWindow
+from host.auth import AuthError, AuthService, DEFAULT_PASSWORD
+from host.management import add_member
+from host.server_controller import ServerController
+from host.storage import initialize_campaign
+
+PASSWORD = "我的新密码🎲123456"
+CONNECTED = QAbstractSocket.SocketState.ConnectedState
+
+
+class AddressTests(unittest.TestCase):
+    def test_malformed_tokens_are_rejected_before_building_headers(self) -> None:
+        response = {
+            "member_id": "member", "campaign_id": "campaign",
+            "campaign_name": "团本", "actor_name": "调查员",
+        }
+        for token in ("🎲" * 43, "a" * 42 + "\n", "a" * 42):
+            with self.subTest(length=len(token)), self.assertRaises(ValueError):
+                ClientSession.from_response({**response, "token": token})
+
+    def test_http_and_websocket_share_origin_and_prefix(self) -> None:
+        cases = (
+            ("ws://127.0.0.1:8000/ws/lobby", "http://127.0.0.1:8000/", "ws://127.0.0.1:8000/ws/lobby"),
+            ("https://example.com/story", "https://example.com/story/", "wss://example.com/story/ws/lobby"),
+            ("wss://example.com/story/ws/lobby", "https://example.com/story/", "wss://example.com/story/ws/lobby"),
+            ("http://[::1]:8000", "http://[::1]:8000/", "ws://[::1]:8000/ws/lobby"),
+        )
+        for text, expected_http, expected_ws in cases:
+            with self.subTest(text=text):
+                http, websocket = server_urls(text)
+                self.assertEqual(http.toString(), expected_http)
+                self.assertEqual(websocket.toString(), expected_ws)
+
+    def test_embedded_credentials_query_and_invalid_addresses_are_rejected(self) -> None:
+        for text in ("localhost", "ftp://localhost", "ws://localhost/wrong",
+                     "http://user:password@localhost", "ws://localhost/ws/lobby?token=secret",
+                     "http://localhost/#fragment"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                server_urls(text)
+
+
+class ClientGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = initialize_campaign(Path(self.temporary.name), "玩家联调团")
+        add_member(self.directory, "调查员甲")
+        self.settings_path = str(Path(self.temporary.name) / "player.ini")
+        self.service = AuthService(self.directory)
+        self.server = ServerController()
+        self.server_errors = []
+        self.server_messages = []
+        self.server.errorOccurred.connect(self.server_errors.append)
+        self.server.messageReceived.connect(self.server_messages.append)
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            self.port = listener.getsockname()[1]
+        self.address = f"ws://127.0.0.1:{self.port}/ws/lobby"
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.players = []
+        self.wait_until(lambda: self.server.state == "running")
+        self.player = self.new_player()
+
+    def tearDown(self) -> None:
+        for player in self.players:
+            player.close()
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        for player in self.players:
+            player.deleteLater()
+        self.server.deleteLater()
+        self.app.processEvents()
+        self.temporary.cleanup()
+
+    def wait_until(self, condition, timeout=15) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            self.app.processEvents()
+            if condition():
+                return
+            if time.monotonic() > deadline:
+                feedback = [player.feedback.text() for player in self.players]
+                self.fail(f"客户端等待超时，{feedback}，{self.server_errors}")
+            time.sleep(0.01)
+
+    def new_player(self) -> PlayerWindow:
+        player = PlayerWindow(QSettings(self.settings_path, QSettings.Format.IniFormat))
+        player.address.setText(self.address)
+        player.campaign_name.setText("玩家联调团")
+        player.actor_name.setText("调查员甲")
+        self.players.append(player)
+        return player
+
+    def login(self, player: PlayerWindow, password: str) -> None:
+        player.password.setText(password)
+        player.login_button.click()
+        self.wait_until(lambda: not player._busy)
+
+    def ready_player(self) -> None:
+        self.login(self.player, DEFAULT_PASSWORD)
+        self.wait_until(lambda: self.player.lobby is not None and self.player.lobby.socket.state() == CONNECTED)
+
+    def test_first_login_enters_lobby_and_binds_sender(self) -> None:
+        self.ready_player()
+        self.assertIn("调查员甲", self.player.identity.text())
+        self.assertTrue(self.player.lobby.nickname.isReadOnly())
+        self.server.command("say", text="欢迎调查员 🎲")
+        self.wait_until(lambda: "欢迎调查员 🎲" in self.player.lobby.chat_history.toPlainText())
+        self.player.lobby.message.setPlainText("中文 🎲\n第二行  ")
+        self.player.lobby.send_button.click()
+        self.wait_until(lambda: not self.player.lobby._awaiting_send)
+        self.assertEqual(self.player.lobby.message.toPlainText(), "")
+        self.assertIn("调查员甲：中文 🎲\n第二行  ", self.player.lobby.chat_history.toPlainText())
+        self.player.lobby.socket.sendTextMessage(json.dumps({
+            "type": "chat.send", "text": "伪造发言人", "nickname": "KP", "member_id": "someone-else",
+        }))
+        self.wait_until(lambda: "伪造发言人" in self.player.lobby.chat_history.toPlainText())
+        self.assertIn("调查员甲：伪造发言人", self.player.lobby.chat_history.toPlainText())
+
+    def test_wrong_password_stays_on_login(self) -> None:
+        self.login(self.player, "wrong")
+        self.assertIsNone(self.player.session)
+        self.assertEqual(self.player.pages.currentIndex(), 0)
+        self.assertIn("错误", self.player.feedback.text())
+        self.assertTrue(self.player.login_button.isEnabled())
+
+    def test_campaign_name_is_required_and_checked_by_host(self) -> None:
+        for name, message in (("", "请填写团名"), ("别的团", "团名与主机当前开启的团不一致")):
+            self.player.campaign_name.setText(name)
+            self.login(self.player, DEFAULT_PASSWORD)
+            self.assertIsNone(self.player.session)
+            self.assertEqual(self.player.pages.currentIndex(), 0)
+            self.assertIn(message, self.player.feedback.text())
+        self.player.campaign_name.setText("玩家联调团")
+        self.ready_player()
+
+    def test_password_dialog_and_recent_login_switching(self) -> None:
+        self.ready_player()
+        socket_before_change = self.player.lobby.socket
+
+        def fill_password_dialog():
+            dialog = self.player.findChild(PasswordDialog)
+            dialog.current_password.setText(DEFAULT_PASSWORD)
+            dialog.new_password.setText(PASSWORD)
+            dialog.confirm_password.setText(PASSWORD)
+            dialog.accept()
+
+        QTimer.singleShot(0, fill_password_dialog)
+        self.player.change_button.click()
+        self.wait_until(lambda: not self.player._busy)
+        self.assertIn("密码已更新", self.player.feedback.text())
+        self.assertIs(self.player.lobby.socket, socket_before_change)
+        self.assertEqual(socket_before_change.state(), CONNECTED)
+
+        add_member(self.directory, "调查员乙")
+        second = self.new_player()
+        second.actor_name.setText("调查员乙")
+        self.login(second, DEFAULT_PASSWORD)
+        reopened = PlayerWindow(QSettings(self.settings_path, QSettings.Format.IniFormat))
+        self.players.append(reopened)
+        self.assertIsNone(reopened.session)
+        self.assertEqual(reopened.saved_logins.currentText(), "[玩家联调团]-调查员乙")
+        reopened.saved_logins.setCurrentIndex(1)
+        self.assertEqual(reopened.campaign_name.text(), "玩家联调团")
+        self.assertEqual(reopened.actor_name.text(), "调查员甲")
+        self.assertEqual(reopened.address.text(), self.address)
+        self.assertEqual(reopened.password.text(), PASSWORD)
+        reopened.saved_logins.setCurrentIndex(2)
+        self.assertEqual(reopened.saved_logins.currentText(), "新登录")
+        self.assertEqual(reopened.campaign_name.text(), "")
+        self.assertEqual(reopened.actor_name.text(), "")
+        self.assertTrue(reopened.remember_password.isChecked())
+
+    def test_relogin_replaces_old_qt_client_and_restores_its_draft(self) -> None:
+        self.ready_player()
+        self.player.lobby.message.setPlainText("被顶替时保留的草稿")
+        second = self.new_player()
+        self.login(second, DEFAULT_PASSWORD)
+        self.wait_until(lambda: second.lobby is not None and second.lobby.socket.state() == CONNECTED)
+        self.wait_until(lambda: self.player.session is None)
+        self.assertEqual(self.player.pages.currentIndex(), 0)
+        self.assertIn("失效", self.player.feedback.text())
+        self.login(self.player, DEFAULT_PASSWORD)
+        self.wait_until(lambda: self.player.lobby is not None and self.player.lobby.socket.state() == CONNECTED)
+        self.wait_until(lambda: second.session is None)
+        self.assertEqual(self.player.lobby.message.toPlainText(), "被顶替时保留的草稿")
+
+    def test_logout_revokes_session_and_restores_saved_login(self) -> None:
+        data_dir = Path(self.temporary.name) / "app-data"
+        data_dir.mkdir()
+        # 隔离旧注册表中的真实用户记录，走默认设置文件路径。
+        (data_dir / "player.ini").touch()
+        with patch("client.login_history.QStandardPaths.writableLocation", return_value=str(data_dir)):
+            player = PlayerWindow()
+            self.players.append(player)
+            self.assertEqual(player.saved_logins.currentText(), "新登录")
+            player.address.setText(self.address)
+            player.campaign_name.setText("玩家联调团")
+            player.actor_name.setText("调查员甲")
+            self.login(player, DEFAULT_PASSWORD)
+            self.wait_until(lambda: player.lobby is not None and player.lobby.socket.state() == CONNECTED)
+            token = player.session.token
+            player.logout_button.click()
+            self.wait_until(lambda: not player._busy)
+            self.assertIsNone(player.session)
+            self.assertIsNone(player.lobby)
+            self.assertEqual(player.saved_logins.currentText(), "[玩家联调团]-调查员甲")
+            player.close()
+
+            reopened = PlayerWindow()
+            self.players.append(reopened)
+            self.assertIsNone(reopened.session)
+            self.assertEqual(reopened.saved_logins.currentText(), "[玩家联调团]-调查员甲")
+            self.assertEqual(reopened.campaign_name.text(), "玩家联调团")
+            self.assertEqual(reopened.actor_name.text(), "调查员甲")
+            self.assertEqual(reopened.address.text(), self.address)
+            self.assertEqual(reopened.password.text(), DEFAULT_PASSWORD)
+        with self.assertRaises(AuthError):
+            self.service.require_session(token)
+
+    def test_stopped_host_keeps_draft_and_allows_manual_reconnect(self) -> None:
+        self.ready_player()
+        self.player.lobby.message.setPlainText("停服时的草稿 🎲")
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        self.wait_until(lambda: not self.player._busy)
+        self.assertIsNotNone(self.player.session)
+        self.assertEqual(self.player.lobby.message.toPlainText(), "停服时的草稿 🎲")
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait_until(lambda: self.server.state == "running")
+        self.player.lobby.connect_button.click()
+        self.wait_until(lambda: self.player.lobby.socket.state() == CONNECTED)
+        self.player.lobby.send_button.click()
+        self.wait_until(lambda: not self.player.lobby._awaiting_send)
+        self.assertIn("停服时的草稿 🎲", self.player.lobby.chat_history.toPlainText())
+
+
+if __name__ == "__main__":
+    unittest.main()

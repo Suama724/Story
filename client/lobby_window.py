@@ -1,9 +1,9 @@
 import json
 
-from PySide6.QtCore import Qt, QUrl, QUrlQuery, Slot
+from PySide6.QtCore import Qt, QUrl, QUrlQuery, Signal, Slot
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtNetwork import QAbstractSocket, QNetworkProxy
-from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtNetwork import QAbstractSocket, QNetworkProxy, QNetworkRequest
+from PySide6.QtWebSockets import QWebSocket, QWebSocketProtocol
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -23,6 +23,8 @@ from chat_protocol import (
     chat_text_error,
     decode_event,
 )
+
+from .auth_client import ClientSession
 
 SocketState = QAbstractSocket.SocketState
 
@@ -46,15 +48,20 @@ SEND_ERRORS = {
 class LobbyWindow(QWidget):
     """单大厅聊天窗口。"""
 
-    def __init__(self) -> None:
+    sessionRejected = Signal()
+    sessionCheckRequested = Signal()
+
+    def __init__(self, *, session: ClientSession | None = None, address: str = DEFAULT_ADDRESS) -> None:
         super().__init__()
+        self.session = session
+        self._manual_disconnect = False
         self.setWindowTitle("Story · 大厅")
         self.resize(640, 440)
 
         self.socket = QWebSocket(parent=self)
         # 直连测试主机，避免系统代理接管局域网连接。
         self.socket.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
-        self.address = QLineEdit(DEFAULT_ADDRESS)
+        self.address = QLineEdit(address)
         self.nickname = QLineEdit()
         self.nickname.setPlaceholderText("输入临时昵称")
         self.connect_button = QPushButton("连接")
@@ -70,6 +77,11 @@ class LobbyWindow(QWidget):
         self.message.setFixedHeight(80)
         self.send_button = QPushButton("发送")
         self._awaiting_send = False
+        if session is not None:
+            self.nickname.setText(session.actor_name)
+            self.nickname.setReadOnly(True)
+            self.address.setReadOnly(True)
+            self.connect_button.setText("重新连接")
 
         self._build_layout()
         self._connect_signals()
@@ -79,7 +91,7 @@ class LobbyWindow(QWidget):
         connection_row = QHBoxLayout()
         connection_row.addWidget(QLabel("主机地址"))
         connection_row.addWidget(self.address, stretch=1)
-        connection_row.addWidget(QLabel("昵称"))
+        connection_row.addWidget(QLabel("角色" if self.session else "昵称"))
         connection_row.addWidget(self.nickname)
         connection_row.addWidget(self.connect_button)
         connection_row.addWidget(self.disconnect_button)
@@ -103,6 +115,7 @@ class LobbyWindow(QWidget):
         self.socket.connected.connect(self.chat_history.clear)
         self.socket.textMessageReceived.connect(self._show_message)
         self.socket.errorOccurred.connect(self._show_socket_error)
+        self.socket.disconnected.connect(self._disconnected)
 
     @Slot()
     def _open_connection(self) -> None:
@@ -118,26 +131,39 @@ class LobbyWindow(QWidget):
             self.feedback.setText("地址无效，请输入完整的 WebSocket 地址。")
             return
 
-        nickname = self.nickname.text().strip()
-        if not nickname or len(nickname.splitlines()) != 1:
-            self.feedback.setText("请输入单行昵称。")
-            return
-
-        query = QUrlQuery(address)
-        query.removeAllQueryItems("nickname")
-        encoded_nickname = QUrl.toPercentEncoding(nickname).data().decode("ascii")
-        query.addQueryItem("nickname", encoded_nickname)
-        address.setQuery(query)
-
         self.feedback.clear()
-        self.socket.open(address)
+        self._manual_disconnect = False
+        if self.session is not None:
+            request = QNetworkRequest(address)
+            request.setRawHeader(b"Authorization", f"Bearer {self.session.token}".encode("ascii"))
+            self.socket.open(request)
+        else:
+            nickname = self.nickname.text().strip()
+            if not nickname or len(nickname.splitlines()) != 1:
+                self.feedback.setText("请输入单行昵称。")
+                return
+            query = QUrlQuery(address)
+            query.removeAllQueryItems("nickname")
+            encoded_nickname = QUrl.toPercentEncoding(nickname).data().decode("ascii")
+            query.addQueryItem("nickname", encoded_nickname)
+            address.setQuery(query)
+            self.socket.open(address)
 
     @Slot()
     def _close_connection(self) -> None:
+        self._manual_disconnect = True
         if self.socket.state() == SocketState.ConnectedState:
             self.socket.close()
         else:
             self.socket.abort()
+
+    def _disconnected(self) -> None:
+        if self.session is None or self._manual_disconnect:
+            return
+        if self.socket.closeCode() == QWebSocketProtocol.CloseCode.CloseCodePolicyViolated:
+            self.sessionRejected.emit()
+        else:
+            self.sessionCheckRequested.emit()
 
     def _update_connection_state(self, state: SocketState) -> None:
         connected = state == SocketState.ConnectedState
