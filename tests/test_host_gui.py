@@ -8,16 +8,19 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.request import ProxyHandler, Request, build_opener
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtWidgets import QApplication, QMessageBox
 from websockets.asyncio.client import connect
 
 from chat_protocol import HISTORY_PAGE_SIZE
 from host.auth import AuthService, DEFAULT_PASSWORD
-from host.host_window import HostWindow
+from host.host_window import HostWindow, SceneDialog
+from client.player_window import PlayerWindow
 from host.management import add_member, campaign_details, discover_campaigns, edit_member
 from host.messages import save_lobby_message
 from host.storage import open_campaign
@@ -32,9 +35,13 @@ class HostGuiTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.window = HostWindow(self.root)
+        self.players = []
         self.wait_until(lambda: not self.window._busy)
 
     def tearDown(self) -> None:
+        for player in self.players:
+            player.close()
+            player.deleteLater()
         self.window.server.stop()
         self.wait_until(lambda: not self.window.server.active, timeout=10)
         self.wait_until(lambda: not self.window._busy)
@@ -231,6 +238,122 @@ class HostGuiTests(unittest.TestCase):
         self.start_listener()
         self.window.server.process.closeWriteChannel()
         self.wait_until(lambda: self.window.server.state == "stopped")
+
+    def test_scene_creation_and_archive_work_offline_and_survive_reopen(self) -> None:
+        campaign = self.create_from_form()
+        add_member(campaign["directory"], "离线角色")
+        self.window.members_refresh.click()
+        self.wait_until(lambda: not self.window._busy)
+
+        def fill_scene():
+            dialog = self.window.findChild(SceneDialog)
+            dialog.name.setText("离线场景")
+            dialog.members.item(0).setCheckState(Qt.CheckState.Checked)
+            dialog.accept()
+
+        QTimer.singleShot(0, fill_scene)
+        self.window.create_scene_button.click()
+        self.wait_until(lambda: len(self.window._channels) == 2 and not self.window._busy)
+        scene = self.window._channel_id
+        self.assertEqual(self.window._channels[scene]["name"], "离线场景")
+        self.assertFalse(self.window.server.active)
+        self.assertTrue(self.window.archive_scene_button.isEnabled())
+        with patch("host.host_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            self.window.archive_scene_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window._channels[scene]["status"], "archived")
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window._channels[scene]["status"], "archived")
+
+    def test_scene_form_private_chat_broad_observation_and_archive(self) -> None:
+        campaign = self.create_from_form()
+        for name in ("A", "B"):
+            add_member(campaign["directory"], name)
+        self.window.members_refresh.click()
+        self.wait_until(lambda: not self.window._busy)
+        port = self.start_listener()
+        for name in ("A", "B"):
+            player = PlayerWindow(QSettings(str(self.root / f"{name}.ini"), QSettings.Format.IniFormat))
+            self.players.append(player)
+            player.address.setText(f"ws://127.0.0.1:{port}/ws/lobby")
+            player.campaign_name.setText(campaign["name"])
+            player.actor_name.setText(name)
+            player.password.setText(DEFAULT_PASSWORD)
+            player.login_button.click()
+            self.wait_until(lambda: player.lobby is not None and player.lobby._channel_state_ready)
+        a, b = (player.lobby for player in self.players)
+        self.window.message_input.setPlainText("大厅欢迎")
+        self.window.send_button.click()
+        self.wait_until(lambda: "大厅欢迎" in a.chat_history.toPlainText() and "大厅欢迎" in b.chat_history.toPlainText()
+                        and self.window.create_scene_button.isEnabled())
+        a.message.setPlainText("大厅草稿")
+        b.message.setPlainText("B 的草稿")
+
+        def fill_scene():
+            dialog = self.window.findChild(SceneDialog)
+            dialog.name.setText("地下室")
+            for index in range(dialog.members.count()):
+                if dialog.members.item(index).text() == "A":
+                    dialog.members.item(index).setCheckState(Qt.CheckState.Checked)
+            dialog.accept()
+
+        QTimer.singleShot(0, fill_scene)
+        self.window.create_scene_button.click()
+        self.wait_until(lambda: len(self.window._channels) == 2 and not self.window._busy)
+        scene = next(key for key, value in self.window._channels.items() if value["kind"] == "scene")
+        lobby = campaign["lobby_id"]
+        self.wait_until(lambda: a._assigned_channel_id == scene)
+        self.assertEqual(b.channel_choice.count(), 1)
+        self.assertEqual(a._channel_id, scene)
+        self.assertNotIn("大厅欢迎", a.chat_history.toPlainText())
+        self.window.message_input.setPlainText("地下室线索 🎲")
+        self.window.send_button.click()
+        self.wait_until(lambda: "地下室线索 🎲" in a.chat_history.toPlainText())
+        self.assertNotIn("地下室线索", b.chat_history.toPlainText())
+        a.message.setPlainText("地下室草稿")
+        a.channel_choice.setCurrentIndex(a.channel_choice.findData(lobby))
+        self.assertEqual(a.message.toPlainText(), "大厅草稿")
+        self.assertNotIn("地下室线索", a.chat_history.toPlainText())
+        self.assertFalse(a.send_button.isEnabled())
+        a.channel_choice.setCurrentIndex(a.channel_choice.findData(scene))
+        self.assertEqual(a.message.toPlainText(), "地下室草稿")
+
+        replies = []
+        b.socket.textMessageReceived.connect(lambda payload: replies.append(json.loads(payload)))
+        b.socket.sendTextMessage(json.dumps({"type": "chat.history.get", "channel_id": scene, "mode": "latest", "cursor": 0, "request_id": "forged-history"}))
+        self.wait_until(lambda: any(item.get("request_id") == "forged-history" for item in replies))
+        self.assertEqual(next(item for item in replies if item.get("request_id") == "forged-history")["error"], "channel_read_forbidden")
+
+        self.window.visibility_choice.setCurrentIndex(self.window.visibility_choice.findData("broad"))
+        self.wait_until(lambda: scene in b._channels and self.window._channel_request is None)
+        self.assertEqual(b.message.toPlainText(), "B 的草稿")
+        b.channel_choice.setCurrentIndex(b.channel_choice.findData(scene))
+        self.wait_until(lambda: "地下室线索 🎲" in b.chat_history.toPlainText())
+        self.assertFalse(b.send_button.isEnabled())
+        self.window.message_input.setPlainText("旁观可见的新线索")
+        self.window.send_button.click()
+        self.wait_until(lambda: "旁观可见的新线索" in b.chat_history.toPlainText() and self.window.visibility_choice.isEnabled())
+        b.socket.sendTextMessage(json.dumps({"type": "chat.send", "channel_id": scene, "text": "旁观者越权", "request_id": "forged-send"}))
+        self.wait_until(lambda: any(item.get("request_id") == "forged-send" for item in replies))
+        self.assertEqual(next(item for item in replies if item.get("request_id") == "forged-send")["code"], "channel_forbidden")
+        self.window.visibility_choice.setCurrentIndex(self.window.visibility_choice.findData("secret"))
+        self.wait_until(lambda: scene not in b._channels and self.window.archive_scene_button.isEnabled())
+        self.assertEqual(b._channel_id, lobby)
+        self.assertEqual(b.message.toPlainText(), "B 的草稿")
+        self.assertEqual(b._base_cache.for_channel(scene).page(), [])
+
+        with patch("host.host_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            self.window.archive_scene_button.click()
+        self.wait_until(lambda: a._assigned_channel_id == lobby)
+        self.assertEqual(a._channel_id, lobby)
+        self.assertEqual(a.message.toPlainText(), "大厅草稿")
+        a.channel_choice.setCurrentIndex(a.channel_choice.findData(scene))
+        self.wait_until(lambda: "地下室线索 🎲" in a.chat_history.toPlainText())
+        self.assertFalse(a.send_button.isEnabled())
+        self.assertEqual(a.message.toPlainText(), "地下室草稿")
 
 
 if __name__ == "__main__":

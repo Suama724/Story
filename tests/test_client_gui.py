@@ -19,6 +19,7 @@ from client.auth_client import ClientSession, server_urls
 from client.history_cache import HistoryCache
 from client.player_window import PasswordDialog, PlayerWindow
 from host.auth import AuthError, AuthService, DEFAULT_PASSWORD
+from host.channels import archive_scene
 from host.management import add_member
 from host.messages import save_lobby_message
 from host.server_controller import ServerController
@@ -142,7 +143,7 @@ class ClientGuiTests(unittest.TestCase):
 
     def ready_player(self) -> None:
         self.login(self.player, DEFAULT_PASSWORD)
-        self.wait_until(lambda: self.player.lobby is not None and self.player.lobby.socket.state() == CONNECTED)
+        self.wait_until(lambda: self.player.lobby is not None and self.player.lobby._channel_state_ready)
 
     def test_first_login_enters_lobby_and_binds_sender(self) -> None:
         self.ready_player()
@@ -465,6 +466,39 @@ class ClientGuiTests(unittest.TestCase):
         self.login(reopened, DEFAULT_PASSWORD)
         self.assertIsNone(reopened.lobby)
         self.assertEqual(reopened.feedback.text(), "密码错误")
+
+    def test_reconnect_restores_current_assignment_and_offline_archive_returns_to_lobby(self) -> None:
+        self.ready_player()
+        lobby = self.player.lobby
+        lobby_id = lobby._channel_id
+        lobby.message.setPlainText("大厅未发草稿")
+        lobby.disconnect_button.click()
+        self.wait_until(lambda: lobby.socket.state() == UNCONNECTED)
+        states = []
+        self.server.channelsReceived.connect(lambda request_id, state: states.append((request_id, state)))
+        self.server.command("scene.create", name="掉线后分组", member_ids=[self.player.session.member_id],
+                            channel_id="offline-scene", request_id="offline-assignment")
+        self.wait_until(lambda: bool(states))
+        lobby.connect_button.click()
+        self.wait_until(lambda: lobby._channel_state_ready and lobby._assigned_channel_id == "offline-scene")
+        self.assertEqual(lobby._channel_id, "offline-scene")
+        lobby.message.setPlainText("场景中的发言")
+        lobby.send_button.click()
+        self.wait_until(lambda: not lobby._awaiting_send)
+        lobby.disconnect_button.click()
+        self.wait_until(lambda: lobby.socket.state() == UNCONNECTED)
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        archive_scene(self.directory, "offline-scene")
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait_until(lambda: self.server.state == "running")
+        lobby.connect_button.click()
+        self.wait_until(lambda: lobby._channel_state_ready and lobby._assigned_channel_id == lobby_id)
+        self.assertEqual(lobby._channel_id, lobby_id)
+        self.assertEqual(lobby.message.toPlainText(), "大厅未发草稿")
+        lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData("offline-scene"))
+        self.wait_until(lambda: "场景中的发言" in lobby.chat_history.toPlainText())
+        self.assertFalse(lobby.send_button.isEnabled())
 
 
 if __name__ == "__main__":

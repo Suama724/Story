@@ -9,7 +9,7 @@ from uuid import uuid4
 from PySide6.QtCore import QThread, QTimer, Qt, Slot
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
@@ -20,6 +20,7 @@ from chat_protocol import chat_text_error
 from client.chat_history import ChatHistory
 
 from .management import add_member, campaign_details, discover_campaigns, edit_member
+from .channels import archive_scene, create_scene, local_channel_state, set_visibility_mode
 from .messages import local_lobby_history
 from .server_controller import ServerController
 from .storage import initialize_campaign, member_name
@@ -111,12 +112,54 @@ class MemberDialog(QDialog):
         super().accept()
 
 
+class SceneDialog(QDialog):
+    def __init__(self, parent: QWidget, members: list[dict]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("新建场景")
+        self.resize(400, 360)
+        self.name = QLineEdit()
+        self.name.setMaxLength(80)
+        self.name.setPlaceholderText("例如，地下室")
+        self.members = QListWidget()
+        for member in members:
+            if member["role"] != "pl":
+                continue
+            item = QListWidgetItem(member["actor_name"])
+            item.setData(Qt.ItemDataRole.UserRole, member["member_id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.members.addItem(item)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label("场景名称"))
+        layout.addWidget(self.name)
+        layout.addWidget(label("选择进入场景的角色"))
+        layout.addWidget(self.members)
+        self.feedback = label()
+        layout.addWidget(self.feedback)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("创建场景")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_members(self) -> list[str]:
+        return [self.members.item(index).data(Qt.ItemDataRole.UserRole) for index in range(self.members.count())
+                if self.members.item(index).checkState() == Qt.CheckState.Checked]
+
+    def accept(self) -> None:
+        if not self.name.text().strip():
+            self.feedback.setText("请填写场景名称。")
+            return
+        super().accept()
+
+
 class HostWindow(QMainWindow):
     def __init__(self, data_root: Path) -> None:
         super().__init__()
         self.setWindowTitle("Story · 主机工作台")
-        self.resize(1120, 760)
-        self.setMinimumSize(960, 640)
+        self.resize(1120, 840)
+        self.setMinimumSize(960, 720)
         self.setStyleSheet(STYLE)
         self.data_root = data_root.resolve()
         self.campaign: dict | None = None
@@ -129,6 +172,13 @@ class HostWindow(QMainWindow):
         self._history_has_more = False
         self._pending_send: str | None = None
         self._retry_send: tuple[str, str] | None = None
+        self._channel_id = ""
+        self._channels: dict[str, dict] = {}
+        self._channel_request: str | None = None
+        self._next_channel_id: str | None = None
+        self._channel_drafts: dict[str, tuple[str, tuple[str, str] | None]] = {}
+        self._queued_channel_state: dict | None = None
+        self._visibility_mode = "secret"
         self.server = ServerController(self)
         self.server.stateChanged.connect(self._network_state)
         self.server.errorOccurred.connect(self._report_error)
@@ -136,6 +186,8 @@ class HostWindow(QMainWindow):
         self.server.sendConfirmed.connect(self._send_confirmed)
         self.server.sendFailed.connect(self._send_failed)
         self.server.passwordChanged.connect(self._reload_campaign)
+        self.server.channelsReceived.connect(self._channels_received)
+        self.server.sendFailed.connect(self._channel_command_failed)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -297,10 +349,30 @@ class HostWindow(QMainWindow):
         people_layout.addWidget(self.members_refresh)
 
         channel, channel_layout = panel()
-        channel_layout.addWidget(label("总频道", "heading"))
+        channel_layout.addWidget(label("场景与聊天", "heading"))
+        channel_row = QHBoxLayout()
+        self.channel_choice = QComboBox()
+        self.channel_choice.currentIndexChanged.connect(self._select_host_channel)
+        self.create_scene_button = QPushButton("新建场景")
+        self.create_scene_button.clicked.connect(self._create_scene)
+        self.archive_scene_button = QPushButton("结束场景")
+        self.archive_scene_button.clicked.connect(self._archive_scene)
+        channel_row.addWidget(self.channel_choice, 1)
+        channel_row.addWidget(self.create_scene_button)
+        channel_row.addWidget(self.archive_scene_button)
+        channel_layout.addLayout(channel_row)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(label("场景阅读模式"))
+        self.visibility_choice = QComboBox()
+        self.visibility_choice.addItem("保密 · 按参与范围阅读", "secret")
+        self.visibility_choice.addItem("宽泛 · 可旁观其他聊天室", "broad")
+        self.visibility_choice.currentIndexChanged.connect(self._change_visibility)
+        mode_row.addWidget(self.visibility_choice, 1)
+        channel_layout.addLayout(mode_row)
         self.tabs = QTabWidget()
         self.messages = ChatHistory()
-        self.server.messageReceived.connect(self.messages.add_message)
+        self.messages.setMinimumHeight(140)
+        self.server.messageReceived.connect(self._receive_message)
         self.messages.setPlaceholderText("暂无大厅消息。")
         history_tab = QWidget()
         history_layout = QVBoxLayout(history_tab)
@@ -312,7 +384,7 @@ class HostWindow(QMainWindow):
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(1000)
         self.logs.setFont(QFont("Consolas", 10))
-        self.tabs.addTab(history_tab, "大厅消息")
+        self.tabs.addTab(history_tab, "频道消息")
         self.tabs.addTab(self.logs, "运行日志")
         channel_layout.addWidget(self.tabs, 1)
         self.message_input = QPlainTextEdit()
@@ -349,12 +421,19 @@ class HostWindow(QMainWindow):
         self._job = None
         self._busy = False
         if error:
+            self._next_channel_id = None
+            self.visibility_choice.blockSignals(True)
+            self.visibility_choice.setCurrentIndex(self.visibility_choice.findData(self._visibility_mode))
+            self.visibility_choice.blockSignals(False)
             self._report_error(error)
         else:
             self.feedback.setText("")
             if not self._closing:
                 self._on_result(result)
         self._update_buttons()
+        if self._queued_channel_state is not None and not self._busy and not self._closing:
+            state, self._queued_channel_state = self._queued_channel_state, None
+            self._populate_channels(state)
         if self._closing and not self.server.active:
             QTimer.singleShot(0, self.close)
         elif self._refresh_pending and not self._closing:
@@ -412,7 +491,9 @@ class HostWindow(QMainWindow):
 
     @staticmethod
     def _read_campaign(directory: Path) -> tuple[dict, dict]:
-        return campaign_details(directory), local_lobby_history(directory)
+        campaign = campaign_details(directory)
+        campaign["channel_state"] = local_channel_state(directory)
+        return campaign, local_lobby_history(directory)
 
     def _enter_campaign(self, result: tuple[dict, dict]) -> None:
         campaign, history = result
@@ -425,6 +506,9 @@ class HostWindow(QMainWindow):
         self.campaign_description.setVisible(bool(description))
         self.header_state.setText("本地管理 · 监听已关闭")
         self.messages.clear()
+        self._channel_drafts.clear()
+        self._channel_id = campaign["lobby_id"]
+        self._populate_channels(campaign["channel_state"])
         self._show_history(history)
         self._retry_send = None
         self.message_input.clear()
@@ -439,7 +523,103 @@ class HostWindow(QMainWindow):
         before = self.messages.oldest_sequence
         if self.campaign is not None and self._history_has_more and before is not None:
             directory = self.campaign["directory"]
-            self._run(lambda: local_lobby_history(directory, before=before), self._show_history)
+            channel_id = self._channel_id
+            self._run(lambda: local_lobby_history(directory, before=before, channel_id=channel_id), self._show_history)
+
+    def _populate_channels(self, state: dict) -> None:
+        self._channels = {item["channel_id"]: item for item in state["channels"]}
+        self._visibility_mode = state["visibility_mode"]
+        selected = self._next_channel_id or self._channel_id
+        self._next_channel_id = None
+        if selected not in self._channels:
+            selected = state["current_channel_id"]
+        self.channel_choice.blockSignals(True)
+        self.channel_choice.clear()
+        for item in state["channels"]:
+            suffix = "（归档）" if item["status"] == "archived" else ""
+            self.channel_choice.addItem(item["name"] + suffix, item["channel_id"])
+        self.channel_choice.setCurrentIndex(self.channel_choice.findData(selected))
+        self.channel_choice.blockSignals(False)
+        self.visibility_choice.blockSignals(True)
+        self.visibility_choice.setCurrentIndex(self.visibility_choice.findData(state["visibility_mode"]))
+        self.visibility_choice.blockSignals(False)
+        if selected != self._channel_id:
+            self._select_host_channel(self.channel_choice.currentIndex())
+        self._update_buttons()
+
+    def _select_host_channel(self, _index: int) -> None:
+        selected = self.channel_choice.currentData()
+        if selected not in self._channels or selected == self._channel_id:
+            return
+        self._channel_drafts[self._channel_id] = (self.message_input.toPlainText(), self._retry_send)
+        self._channel_id = selected
+        text, self._retry_send = self._channel_drafts.get(selected, ("", None))
+        self.message_input.setPlainText(text)
+        self.messages.clear()
+        directory = self.campaign["directory"]
+        self._run(lambda: local_lobby_history(directory, channel_id=selected), self._show_history)
+
+    def _receive_message(self, event: dict) -> None:
+        if event.get("channel_id") == self._channel_id:
+            self.messages.add_message(event)
+
+    def _create_scene(self) -> None:
+        dialog = SceneDialog(self, self.campaign["members"])
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        channel_id = str(uuid4())
+        self._next_channel_id = channel_id
+        self._channel_operation("scene.create", name=dialog.name.text(), member_ids=dialog.selected_members(),
+                                channel_id=channel_id)
+
+    def _archive_scene(self) -> None:
+        channel = self._channels[self._channel_id]
+        if QMessageBox.question(self, "结束场景", f"结束「{channel['name']}」并让其中的角色回到大厅？") != QMessageBox.StandardButton.Yes:
+            return
+        self._channel_operation("scene.archive", channel_id=self._channel_id)
+
+    def _change_visibility(self, _index: int) -> None:
+        if self.campaign is not None:
+            self._channel_operation("visibility.set", mode=self.visibility_choice.currentData())
+
+    def _channel_operation(self, operation: str, **values: object) -> None:
+        if self.server.state == "running":
+            request_id = str(uuid4())
+            if self.server.command(operation, request_id=request_id, **values):
+                self._channel_request = request_id
+                self.feedback.setText("正在更新场景…")
+                self._update_buttons()
+            return
+        directory = self.campaign["directory"]
+
+        def update() -> dict:
+            if operation == "scene.create":
+                create_scene(directory, values["name"], values["member_ids"], channel_id=values["channel_id"])
+            elif operation == "scene.archive":
+                archive_scene(directory, values["channel_id"])
+            elif operation == "visibility.set":
+                set_visibility_mode(directory, values["mode"])
+            return local_channel_state(directory)
+
+        self._run(update, self._populate_channels)
+
+    def _channels_received(self, request_id: str, state: dict) -> None:
+        if self.campaign is None:
+            return
+        if request_id == self._channel_request:
+            self._channel_request = None
+            self.feedback.clear()
+        if self._busy:
+            self._queued_channel_state = state
+            return
+        self._populate_channels(state)
+
+    def _channel_command_failed(self, request_id: str) -> None:
+        if request_id == self._channel_request:
+            self._channel_request = None
+            self._next_channel_id = None
+            self.server.command("channels")
+            self._update_buttons()
 
     def _populate_members(self) -> None:
         selected = self._selected_member()
@@ -532,6 +712,10 @@ class HostWindow(QMainWindow):
         self.network_status.setText(captions[state])
         self.header_state.setText(f"本地管理 · {captions[state]}")
         self.network_button.setText("启动监听" if state == "stopped" else "停止监听")
+        if state == "running":
+            self.server.command("channels")
+        if state == "stopped":
+            self._channel_request = None
         self._update_buttons()
         if state == "stopped":
             if self._pending_send is not None:
@@ -542,6 +726,7 @@ class HostWindow(QMainWindow):
                 QTimer.singleShot(0, self.close)
             elif self._returning:
                 self._return_to_selector()
+        self._update_buttons()
 
     def _send_message(self) -> None:
         if self._pending_send is not None or self.server.state != "running":
@@ -553,14 +738,14 @@ class HostWindow(QMainWindow):
         if self._retry_send is None or self._retry_send[0] != text:
             self._retry_send = (text, str(uuid4()))
         request_id = self._retry_send[1]
-        if self.server.command("say", text=text, request_id=request_id):
+        if self.server.command("say", text=text, request_id=request_id, channel_id=self._channel_id):
             self._pending_send = request_id
             self.message_input.setReadOnly(True)
             self._update_buttons()
 
     def _send_confirmed(self, request_id: str, message: dict[str, object]) -> None:
         if request_id == self._pending_send:
-            self.messages.add_message(message)
+            self._receive_message(message)
             self._pending_send = None
             self._retry_send = None
             self.message_input.clear()
@@ -586,12 +771,17 @@ class HostWindow(QMainWindow):
     def _return_to_selector(self) -> None:
         self._returning = False
         self.campaign = None
+        self._channels.clear()
+        self._channel_id = ""
+        self._channel_drafts.clear()
+        self._queued_channel_state = None
+        self._next_channel_id = None
         self.pages.setCurrentIndex(0)
         self.header_state.setText("选择一个团开始")
         self.refresh_campaigns()
 
     def _update_buttons(self, *args: object) -> None:
-        available = not self._busy and not self._closing
+        available = not self._busy and not self._closing and self._channel_request is None
         self.open_button.setEnabled(available and self.campaign_list.currentItem() is not None)
         self.create_button.setEnabled(available)
         self.new_panel.setEnabled(available)
@@ -606,7 +796,16 @@ class HostWindow(QMainWindow):
         self.listen_host.setEnabled(not self.server.active)
         self.listen_port.setEnabled(not self.server.active)
         self.network_button.setEnabled(self.campaign is not None and self.server.state != "stopping" and not self._closing)
-        self.send_button.setEnabled(self.server.state == "running" and self._pending_send is None and not self._closing)
+        channel = self._channels.get(self._channel_id, {})
+        can_send = channel.get("can_send", False)
+        scene_available = available and self.campaign is not None and self._pending_send is None and self.server.state in ("stopped", "running")
+        self.channel_choice.setEnabled(scene_available)
+        self.create_scene_button.setEnabled(scene_available)
+        self.visibility_choice.setEnabled(scene_available)
+        self.archive_scene_button.setEnabled(scene_available and channel.get("kind") == "scene" and channel.get("status") == "active")
+        self.send_button.setText(f"发送到{channel.get('name', '频道')}")
+        self.message_input.setReadOnly(self._pending_send is not None or not can_send)
+        self.send_button.setEnabled(available and self.server.state == "running" and self._pending_send is None and can_send)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.server.active:

@@ -7,6 +7,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtNetwork import QAbstractSocket, QNetworkProxy, QNetworkRequest
 from PySide6.QtWebSockets import QWebSocket, QWebSocketProtocol
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -23,6 +24,8 @@ from chat_protocol import (
     CHAT_HISTORY_GET,
     CHAT_MESSAGE,
     CHAT_SEND,
+    CHANNEL_CHANGED,
+    CHANNEL_STATE_GET,
     HISTORY_PAGE_SIZE,
     LOBBY_PATH,
     PING_INTERVAL_SECONDS,
@@ -52,7 +55,7 @@ STATE_LABELS = {
 
 
 class LobbyWindow(QWidget):
-    """单大厅聊天窗口。"""
+    """带频道权限、历史同步和草稿隔离的聊天窗口。"""
 
     sessionRejected = Signal()
     loginRequested = Signal()
@@ -63,6 +66,16 @@ class LobbyWindow(QWidget):
         self.session = session
         self._managed = session is not None or bool(offline_actor)
         self._cache = cache
+        self._base_cache = cache
+        self._channels: dict[str, dict] = {}
+        self._channel_id = ""
+        self._assigned_channel_id = ""
+        self._channel_drafts: dict[str, tuple[str, tuple[str, str] | None]] = {}
+        self._channel_state_ready = False
+        self._channel_timer = QTimer(self)
+        self._channel_timer.setSingleShot(True)
+        self._channel_timer.timeout.connect(self._channel_state_timed_out)
+        self._history_request_id = ""
         self._history_request: tuple[str, int] | None = None
         self._live_during_sync: list[dict] | None = None
         self._history_timer = QTimer(self)
@@ -96,6 +109,12 @@ class LobbyWindow(QWidget):
         self.connect_button = QPushButton("连接")
         self.disconnect_button = QPushButton("断开")
         self.connection_status = QLabel()
+        self.channel_choice = QComboBox()
+        self.channel_choice.setVisible(self._managed)
+        self.channel_choice.currentIndexChanged.connect(self._select_channel)
+        self.channel_status = QLabel()
+        self.channel_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.channel_status.setVisible(self._managed)
         self.feedback = QLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
         self.feedback.setWordWrap(True)
@@ -120,12 +139,20 @@ class LobbyWindow(QWidget):
         self._connect_signals()
         self._update_connection_state(self.socket.state())
         if self._cache is not None:
-            self._show_cached_page()
+            try:
+                state = self._base_cache.channel_state()
+                if state is not None:
+                    self._apply_channel_state(state, online=False)
+                else:
+                    self._show_cached_page()
+            except (OSError, sqlite3.Error, ValueError):
+                self.feedback.setText("无法读取本地频道信息。")
 
     def resume(self, session: ClientSession, cache: HistoryCache) -> None:
         self.session = session
         self.nickname.setText(session.actor_name)
         if self._cache is None:
+            self._base_cache = cache
             self._cache = cache
             self.older_button.show()
             self._show_cached_page()
@@ -143,8 +170,11 @@ class LobbyWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(connection_row)
         layout.addWidget(self.connection_status)
+        layout.addWidget(self.channel_choice)
+        layout.addWidget(self.channel_status)
         layout.addWidget(self.feedback)
-        layout.addWidget(QLabel("大厅消息"))
+        self.history_label = QLabel("大厅消息")
+        layout.addWidget(self.history_label)
         layout.addWidget(self.older_button)
         layout.addWidget(self.chat_history, stretch=1)
         layout.addWidget(self.message)
@@ -208,6 +238,7 @@ class LobbyWindow(QWidget):
         self._reconnect_timer.stop()
         self._connect_timer.stop()
         self._stop_heartbeat()
+        self._channel_timer.stop()
         if self._session_check is not None:
             self._session_check.cancel()
         if self.socket.state() == SocketState.ConnectedState:
@@ -267,6 +298,8 @@ class LobbyWindow(QWidget):
         self.connect_button.setEnabled(idle and not self._connection_active and not waiting_to_retry)
         self.disconnect_button.setEnabled(waiting_to_retry or (not idle and state != SocketState.ClosingState))
         if not connected:
+            self._channel_state_ready = False
+            self._channel_timer.stop()
             self._finish_history_request()
             self._finish_sync()
         if not connected and self._awaiting_send:
@@ -280,8 +313,9 @@ class LobbyWindow(QWidget):
 
     def _update_send_controls(self) -> None:
         connected = self.socket.state() == SocketState.ConnectedState
-        self.send_button.setEnabled(connected and not self._awaiting_send)
-        self.message.setReadOnly(self._awaiting_send or (self._managed and not connected))
+        can_send = not self._managed or (self._channel_state_ready and self._channels.get(self._channel_id, {}).get("can_send") is True)
+        self.send_button.setEnabled(connected and can_send and not self._awaiting_send)
+        self.message.setReadOnly(self._awaiting_send or (self._managed and (not connected or not can_send)))
 
     def _connected(self) -> None:
         self._opening = False
@@ -295,8 +329,120 @@ class LobbyWindow(QWidget):
                 self.feedback.setText("连接已恢复。")
             self._retry_count = 0
             self._update_connection_state(self.socket.state())
-        if self._cache is None:
+        if not self._managed:
             self.chat_history.clear()
+            return
+        self.socket.sendTextMessage(json.dumps({"type": CHANNEL_STATE_GET}))
+        self._channel_timer.start(5000)
+
+    def _channel_state_timed_out(self) -> None:
+        self.feedback.setText("主机未返回频道信息，正在重新连接。")
+        self.socket.abort()
+
+    def saved_drafts(self) -> dict:
+        self._store_draft()
+        return dict(self._channel_drafts)
+
+    def restore_drafts(self, drafts: dict) -> None:
+        self._channel_drafts.update(drafts)
+        self._restore_draft()
+
+    def _store_draft(self) -> None:
+        self._channel_drafts[self._channel_id] = (self.message.toPlainText(), self.retry_send)
+
+    def _restore_draft(self) -> None:
+        text, self.retry_send = self._channel_drafts.get(self._channel_id, ("", None))
+        self.message.setPlainText(text)
+        self._awaiting_send = False
+
+    def _apply_channel_state(self, state: dict, *, online: bool = True) -> None:
+        channels = state.get("channels")
+        if not isinstance(channels, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("channel_id"), str)
+            and isinstance(item.get("history_ranges"), list) for item in channels
+        ):
+            self.feedback.setText("主机返回的频道信息无效。")
+            return
+        assigned = state.get("current_channel_id")
+        available = {item["channel_id"]: item for item in channels if item.get("can_read") is True}
+        if assigned not in available:
+            self.feedback.setText("主机未返回当前场景。")
+            return
+        self._channel_timer.stop()
+        previous = self._channels.get(self._channel_id)
+        was_ready = self._channel_state_ready
+        selected = self._channel_id
+        if assigned != self._assigned_channel_id or selected not in available:
+            selected = assigned
+        changed = selected != self._channel_id or previous != available[selected]
+        if changed or not was_ready:
+            self._store_draft()
+            self._finish_history_request()
+            self._finish_sync()
+        self._channel_state_ready = online
+        if self._base_cache is not None:
+            try:
+                self._base_cache.save_channel_state(state)
+            except (OSError, sqlite3.Error, ValueError):
+                self.feedback.setText("本地频道信息保存失败。")
+        self._channels = available
+        self._assigned_channel_id = assigned
+        lobby_id = next((item["channel_id"] for item in channels if item["kind"] == "lobby"), "")
+        if "" in self._channel_drafts:
+            self._channel_drafts[lobby_id] = self._channel_drafts.pop("")
+        self.channel_choice.blockSignals(True)
+        self.channel_choice.clear()
+        for item in available.values():
+            suffix = "（归档）" if item["status"] == "archived" else ""
+            self.channel_choice.addItem(item["name"] + suffix, item["channel_id"])
+        self.channel_choice.setCurrentIndex(self.channel_choice.findData(selected))
+        self.channel_choice.blockSignals(False)
+        self._channel_id = selected
+        self._set_channel_cache()
+        if changed:
+            self.chat_history.clear()
+            if self._cache is not None:
+                self._show_cached_page()
+        if changed or not was_ready:
+            self._restore_draft()
+        self._update_channel_status()
+        if online and (changed or not was_ready):
+            self._sync_channel()
+
+    def _set_channel_cache(self) -> None:
+        if self._base_cache is not None and self._channel_id in self._channels:
+            self._cache = self._base_cache.for_channel(
+                self._channel_id, lobby=self._channels[self._channel_id]["kind"] == "lobby",
+            )
+
+    def _update_channel_status(self) -> None:
+        channel = self._channels.get(self._channel_id)
+        assigned = self._channels.get(self._assigned_channel_id)
+        if channel is not None and assigned is not None:
+            self.history_label.setText(f"{channel['name']}消息")
+            suffix = "可发言" if channel["can_send"] else "只读"
+            self.channel_status.setText(f"当前分配 · {assigned['name']}    正在查看 · {channel['name']}（{suffix}）")
+        self._update_send_controls()
+
+    def _select_channel(self, _index: int) -> None:
+        selected = self.channel_choice.currentData()
+        if selected not in self._channels or selected == self._channel_id:
+            return
+        self._store_draft()
+        self._finish_history_request()
+        self._finish_sync()
+        self._channel_id = selected
+        self._set_channel_cache()
+        self.chat_history.clear()
+        if self._cache is not None:
+            self._show_cached_page()
+        self._restore_draft()
+        self._update_channel_status()
+        if self.socket.state() == SocketState.ConnectedState:
+            self._sync_channel()
+
+    def _sync_channel(self) -> None:
+        if self._cache is None:
             return
         self._live_during_sync = []
         try:
@@ -349,7 +495,9 @@ class LobbyWindow(QWidget):
             self._request_history("latest" if before is None else "before", before or 0)
 
     def _request_history(self, mode: str, cursor: int) -> None:
-        payload = json.dumps({"type": CHAT_HISTORY_GET, "mode": mode, "cursor": cursor})
+        self._history_request_id = str(uuid4())
+        payload = json.dumps({"type": CHAT_HISTORY_GET, "mode": mode, "cursor": cursor,
+                              "channel_id": self._channel_id, "request_id": self._history_request_id})
         if self.socket.sendTextMessage(payload) <= 0:
             self._finish_sync()
             self.feedback.setText("无法请求主机历史，已保留本地消息。")
@@ -370,12 +518,14 @@ class LobbyWindow(QWidget):
 
     def _show_history_page(self, event: dict) -> None:
         mode, cursor = event.get("mode"), event.get("cursor")
-        if self._history_request is None or (mode, cursor) != self._history_request:
+        if (self._history_request is None or (mode, cursor) != self._history_request
+                or event.get("channel_id") != self._channel_id
+                or event.get("request_id") != self._history_request_id):
             return
         self._finish_history_request()
         page = event.get("messages")
         if (not isinstance(page, list) or len(page) > HISTORY_PAGE_SIZE
-                or not all(is_saved_message(item) for item in page)):
+                or not all(is_saved_message(item) and item.get("channel_id") == self._channel_id for item in page)):
             self._finish_sync()
             self.feedback.setText("主机历史读取失败。")
             return
@@ -384,7 +534,8 @@ class LobbyWindow(QWidget):
             self._finish_sync()
             self.feedback.setText("主机返回的历史顺序无效。")
             return
-        self._show_saved_messages(page, latest=mode == "latest")
+        synced_through = (sequences[-1] if sequences else cursor) if mode != "before" else None
+        self._show_saved_messages(page, latest=mode == "latest", synced_through=synced_through)
         if mode == "after" and page and event.get("has_more") is True:
             self._request_history("after", sequences[-1])
         elif mode != "before":
@@ -398,17 +549,27 @@ class LobbyWindow(QWidget):
             self._show_saved_messages(messages)
 
     def _show_live_message(self, message: dict) -> None:
+        channel_id = message.get("channel_id")
+        if self._managed and channel_id != self._channel_id:
+            if channel_id in self._channels and self._base_cache is not None and is_saved_message(message):
+                try:
+                    cache = self._base_cache.for_channel(channel_id, lobby=self._channels[channel_id]["kind"] == "lobby")
+                    cache.save([message])
+                except (OSError, sqlite3.Error):
+                    self.feedback.setText("本地历史保存失败。")
+            return
         if self._live_during_sync is None:
             self._show_saved_messages([message])
         else:
             self._live_during_sync.append(message)
 
-    def _show_saved_messages(self, messages: list[dict], *, latest: bool = False) -> None:
+    def _show_saved_messages(self, messages: list[dict], *, latest: bool = False,
+                             synced_through: int | None = None) -> None:
         if self._cache is not None:
             saved = [item for item in messages if is_saved_message(item)]
             try:
                 if saved or latest:
-                    self._cache.save(saved, latest=latest)
+                    self._cache.save(saved, latest=latest, synced_through=synced_through)
             except (OSError, sqlite3.Error, UnicodeError):
                 self.feedback.setText("本地历史保存失败，仍可查看收到的消息。")
         self.chat_history.add_messages(messages)
@@ -426,6 +587,7 @@ class LobbyWindow(QWidget):
 
         event = {"type": CHAT_SEND, "text": text}
         if self.session is not None:
+            event["channel_id"] = self._channel_id
             if self.retry_send is None or self.retry_send[0] != text:
                 self.retry_send = (text, str(uuid4()))
             event["request_id"] = self.retry_send[1]
@@ -442,11 +604,13 @@ class LobbyWindow(QWidget):
     def _show_message(self, payload: str) -> None:
         event = decode_event(payload)
         if event is None:
-            self.feedback.setText("收到无法识别的大厅消息。")
+            self.feedback.setText("收到无法识别的频道消息。")
             return
 
         event_type = event.get("type")
-        if event_type == CHAT_ERROR:
+        if event_type == CHANNEL_CHANGED:
+            self._apply_channel_state(event)
+        elif event_type == CHAT_ERROR:
             if "request_id" not in event or self._matches_pending(event):
                 self._show_send_error(event.get("code"))
         elif event_type == CHAT_ACK:

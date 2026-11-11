@@ -3,7 +3,7 @@
 import sqlite3
 
 APPLICATION_ID = 0x53545259  # STRY
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _unique_character_names(connection: sqlite3.Connection) -> None:
@@ -132,6 +132,20 @@ MIGRATIONS = (
             UNIQUE (channel_id, sequence),
             UNIQUE (member_id, request_id)
         )""",
+    ),
+    (
+        "ALTER TABLE campaigns ADD COLUMN visibility_mode TEXT NOT NULL DEFAULT 'secret' CHECK (visibility_mode IN ('secret', 'broad'))",
+        "ALTER TABLE campaigns ADD COLUMN channel_revision INTEGER NOT NULL DEFAULT 0",
+        """CREATE TABLE channel_memberships (
+            id INTEGER PRIMARY KEY,
+            member_id TEXT NOT NULL REFERENCES members(id),
+            channel_id TEXT NOT NULL REFERENCES channels(id),
+            start_sequence INTEGER NOT NULL CHECK (start_sequence > 0),
+            end_sequence INTEGER CHECK (end_sequence >= 0 AND end_sequence >= start_sequence - 1)
+        )""",
+        """CREATE UNIQUE INDEX one_active_scene_per_member ON channel_memberships(member_id)
+           WHERE end_sequence IS NULL""",
+        "CREATE INDEX channel_participants ON channel_memberships(channel_id, member_id)",
     ),
 )
 

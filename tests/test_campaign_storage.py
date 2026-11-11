@@ -80,7 +80,7 @@ class CampaignStorageTests(unittest.TestCase):
                 original = campaign_info(connection)
 
         with open_campaign(directory) as connection:
-            self.assertEqual(campaign_info(connection), {**original, "schema_version": 4})
+            self.assertEqual(campaign_info(connection), {**original, "schema_version": migrations.SCHEMA_VERSION})
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 

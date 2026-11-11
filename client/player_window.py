@@ -106,7 +106,7 @@ class PlayerWindow(QWidget):
         self.history = LoginHistory(settings)
         self._http = None
         self._websocket = None
-        self._drafts: dict[tuple[str, str], tuple[str, tuple[str, str] | None]] = {}
+        self._drafts: dict[tuple[str, str], dict] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -371,8 +371,7 @@ class PlayerWindow(QWidget):
         self.lobby.sessionRejected.connect(self._session_rejected)
         self.lobby.socket.stateChanged.connect(self._update_controls)
         if key is not None:
-            draft, self.lobby.retry_send = self._drafts.pop(key, ("", None))
-            self.lobby.message.setPlainText(draft)
+            self.lobby.restore_drafts(self._drafts.pop(key, {}))
         self.pages.addWidget(self.lobby)
         self.pages.setCurrentWidget(self.lobby)
         self._show_lobby_identity(campaign_name, actor_name)
@@ -387,7 +386,7 @@ class PlayerWindow(QWidget):
         if self.lobby is not None:
             key = self._lobby_identity()
             if key is not None:
-                self._drafts[key] = (self.lobby.message.toPlainText(), self.lobby.retry_send)
+                self._drafts[key] = self.lobby.saved_drafts()
             self.lobby._close_connection()
             self.pages.removeWidget(self.lobby)
             self.lobby.deleteLater()

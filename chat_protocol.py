@@ -10,6 +10,8 @@ CHAT_MESSAGE = "chat.message"
 CHAT_ERROR = "chat.error"
 CHAT_HISTORY_GET = "chat.history.get"
 CHAT_HISTORY = "chat.history"
+CHANNEL_STATE_GET = "channel.state.get"
+CHANNEL_CHANGED = "channel.changed"
 HISTORY_PAGE_SIZE = 50
 PING_INTERVAL_SECONDS = 20
 PONG_TIMEOUT_SECONDS = 10
@@ -23,6 +25,8 @@ SEND_ERRORS = {
     "invalid_request_id": "消息请求 ID 无效。",
     "request_id_conflict": "此请求 ID 已用于另一条消息。",
     "storage_error": "主机保存消息失败，草稿已保留，可以重试。",
+    "channel_forbidden": "你无权在这个频道发言。",
+    "channel_read_forbidden": "你无权查看这个频道。",
 }
 
 
