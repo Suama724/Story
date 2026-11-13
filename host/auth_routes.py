@@ -1,5 +1,7 @@
 """供 Qt 客户端使用的登录与改密接口。"""
 
+from typing import Literal
+
 from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
@@ -14,12 +16,18 @@ class LoginRequest(BaseModel):
     campaign_name: str = Field(min_length=1)
     actor_name: str = Field(min_length=1, max_length=80)
     password: SecretStr
+    role: Literal["pl", "ob"] = "pl"
 
 
 class PasswordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     current_password: SecretStr
     new_password: SecretStr
+
+
+class NicknameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    nickname: str = Field(min_length=1, max_length=80)
 
 
 def bearer_token(authorization: str | None) -> str:
@@ -42,7 +50,7 @@ async def login(body: LoginRequest, request: Request, response: Response) -> dic
     service = auth_service(request)
     async with request.app.state.lobby.lock:
         result = await run_in_threadpool(
-            service.login, body.campaign_name, body.actor_name, body.password.get_secret_value(),
+            service.login, body.campaign_name, body.actor_name, body.password.get_secret_value(), body.role,
         )
         await request.app.state.lobby.revoke_member(result["member_id"], result["token"])
     return result
@@ -70,6 +78,17 @@ async def session_info(request: Request, response: Response) -> dict[str, object
     token = bearer_token(request.headers.get("authorization"))
     session = await run_in_threadpool(service.require_session, token)
     return session.public_info()
+
+
+@router.post("/nickname")
+async def change_nickname(body: NicknameRequest, request: Request, response: Response) -> dict[str, object]:
+    response.headers["Cache-Control"] = "no-store"
+    token = bearer_token(request.headers.get("authorization"))
+    async with request.app.state.lobby.lock:
+        result = await run_in_threadpool(auth_service(request).change_nickname, token, body.nickname)
+        if request.app.state.on_password_changed is not None:
+            request.app.state.on_password_changed()
+    return result
 
 
 @router.post("/logout")

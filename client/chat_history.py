@@ -24,6 +24,10 @@ class ChatHistory(QPlainTextEdit):
     def oldest_sequence(self) -> int | None:
         return min(self._lines, default=None)
 
+    @property
+    def newest_sequence(self) -> int:
+        return self._last_sequence
+
     def add_messages(self, events: list[dict]) -> None:
         lines = []
         inserted_earlier = False

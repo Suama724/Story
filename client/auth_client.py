@@ -39,6 +39,7 @@ class ClientSession:
     campaign_name: str
     member_id: str
     actor_name: str
+    role: str = "pl"
 
     @classmethod
     def from_response(cls, response: dict) -> "ClientSession":
@@ -46,7 +47,10 @@ class ClientSession:
         if (any(not isinstance(response.get(name), str) or not response[name] for name in fields)
                 or re.fullmatch(r"[A-Za-z0-9_-]{43}", response["token"]) is None):
             raise ValueError("主机返回的登录信息不完整。")
-        return cls(**{name: response[name] for name in fields})
+        role = response.get("role", "pl")
+        if role not in ("pl", "ob"):
+            raise ValueError("主机返回的身份无效。")
+        return cls(**{name: response[name] for name in fields}, role=role)
 
 
 class AuthClient(QObject):

@@ -87,10 +87,40 @@ class LoginHistory:
         record = {
             "campaign_id": session.campaign_id, "member_id": session.member_id,
             "campaign_name": session.campaign_name, "actor_name": session.actor_name,
+            "role": session.role,
             "address": address, "password": password if remember else "", "last_used": time.time_ns(),
             "offline_password_hash": f"{salt.hex()}:{digest.hex()}",
         }
         self.settings.setValue(f"logins/{key}", json.dumps(record, ensure_ascii=False))
+        self.settings.sync()
+        return self.settings.status() == QSettings.Status.NoError
+
+    def rename(self, session: ClientSession) -> None:
+        # 只更新名称，保留原来的密码记忆及离线校验散列。
+        key = f"logins/{_profile_key(session.campaign_id, session.member_id)}"
+        self.settings.sync()
+        raw = self.settings.value(key, "", type=str)
+        if not raw:
+            return
+        record = json.loads(raw)
+        record.update(actor_name=session.actor_name, role=session.role)
+        self.settings.setValue(key, json.dumps(record, ensure_ascii=False))
+        self.settings.sync()
+
+    def delete(self, record: dict) -> bool:
+        """只删除匹配的本机登录记录，不修改主机身份或聊天历史。"""
+        self.settings.sync()
+        self.settings.beginGroup("logins")
+        try:
+            for key in self.settings.childKeys():
+                try:
+                    current = json.loads(self.settings.value(key, "", type=str))
+                except ValueError:
+                    continue
+                if current == record:
+                    self.settings.remove(key)
+        finally:
+            self.settings.endGroup()
         self.settings.sync()
         return self.settings.status() == QSettings.Status.NoError
 

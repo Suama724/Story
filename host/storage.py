@@ -32,7 +32,7 @@ def create_member(
     )
     connection.execute(
         "INSERT INTO actors (id, member_id, name, kind, created_at) VALUES (?, ?, ?, ?, ?)",
-        (str(uuid4()), member_id, actor_name, "kp" if role == "kp" else "pc", created_at),
+        (str(uuid4()), member_id, actor_name, {"kp": "kp", "pl": "pc", "ob": "ob"}[role], created_at),
     )
     return member_id
 

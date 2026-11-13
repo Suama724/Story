@@ -6,10 +6,10 @@ from html import escape
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QThread, QTimer, Qt, Slot
+from PySide6.QtCore import QSize, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
@@ -18,12 +18,15 @@ from PySide6.QtWidgets import (
 
 from chat_protocol import chat_text_error
 from client.chat_history import ChatHistory
+from client.player_window import identity_list
 
-from .management import add_member, campaign_details, discover_campaigns, edit_member
-from .channels import archive_scene, create_scene, local_channel_state, set_visibility_mode
+from .management import add_member, campaign_details, edit_member
+from .campaign_library import CampaignLibrary
+from .campaign_dialogs import CampaignManagementDialog, add_campaign_card
+from .channels import archive_scene, create_scene, local_channel_state, mark_channel_read, move_members, set_visibility_mode
 from .messages import local_lobby_history
 from .server_controller import ServerController
-from .storage import initialize_campaign, member_name
+from .storage import member_name
 
 STYLE = """
 QMainWindow, QDialog { background: #e9eef3; color: #203548; }
@@ -40,7 +43,7 @@ QPushButton:focus { border: 2px solid #326b97; }
 QPushButton#primary { background: #326b97; color: white; border-color: #326b97; }
 QPushButton#primary:hover { background: #25577e; }
 QPushButton:disabled, QPushButton#primary:disabled { background: #edf1f5; color: #95a3af; border-color: #d5dee6; }
-QLineEdit, QSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
+QLineEdit, QSpinBox, QPlainTextEdit, QComboBox, QListWidget, QTableWidget {
     background: white; color: #203548; border: 1px solid #ccd6df;
     border-radius: 4px; padding: 5px; selection-background-color: #d5e8f8;
     selection-color: #203548;
@@ -86,12 +89,26 @@ class OperationThread(QThread):
 class MemberDialog(QDialog):
     def __init__(self, parent: QWidget, member: dict | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("编辑人物" if member else "添加角色")
+        self.setWindowTitle("编辑人物" if member else "添加角色 / OB")
         self.resize(400, 180)
         self.actor = QLineEdit(str(member["actor_name"]) if member else "")
         self.actor.setMaxLength(160)
         form = QFormLayout()
+        self.role = QComboBox()
+        self.role.addItem("PL · 玩家角色", "pl")
+        self.role.addItem("OB · 观众", "ob")
+        self.role.setCurrentIndex(self.role.findData(member["role"]) if member else 0)
+        self.role.setEnabled(member is None)
+        form.addRow("身份", self.role)
         form.addRow("角色名", self.actor)
+        self.actor_label = form.labelForField(self.actor)
+        self.password = QLineEdit("123456")
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setMaxLength(256)
+        form.addRow("初始密码", self.password)
+        self.password_label = form.labelForField(self.password)
+        self.role.currentIndexChanged.connect(lambda _: self._update_role(member is None))
+        self._update_role(member is None)
         self.validation = label()
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
@@ -103,9 +120,17 @@ class MemberDialog(QDialog):
         layout.addWidget(self.validation)
         layout.addWidget(buttons)
 
+    def _update_role(self, creating: bool) -> None:
+        is_ob = self.role.currentData() == "ob"
+        self.actor_label.setText("OB 昵称" if is_ob else "角色名")
+        self.password.setVisible(creating and is_ob)
+        self.password_label.setVisible(creating and is_ob)
+
     def accept(self) -> None:
         try:
             member_name(self.actor.text())
+            if self.role.currentData() == "ob" and not self.password.text().strip():
+                raise ValueError("请设置观众密码。")
         except ValueError as error:
             self.validation.setText(str(error))
             return
@@ -134,6 +159,7 @@ class SceneDialog(QDialog):
         layout.addWidget(self.name)
         layout.addWidget(label("选择进入场景的角色"))
         layout.addWidget(self.members)
+        layout.addWidget(label("OB 观众自动旁观全部场景，无需勾选；只能在大厅发言。"))
         self.feedback = label()
         layout.addWidget(self.feedback)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -154,14 +180,83 @@ class SceneDialog(QDialog):
         super().accept()
 
 
+class AssignmentDialog(QDialog):
+    def __init__(self, parent: QWidget, members: list[dict], channels: dict[str, dict],
+                 assignments: dict[str, dict], selected_member: str, selected_channel: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("调整角色分组")
+        self.resize(440, 400)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label("选择要移动的角色"))
+        self.members = QListWidget()
+        for member in members:
+            if member["role"] != "pl":
+                continue
+            current = assignments.get(member["member_id"], {}).get("channel_name", "大厅")
+            item = QListWidgetItem(f"{member['actor_name']} · {current}")
+            item.setData(Qt.ItemDataRole.UserRole, member["member_id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if member["member_id"] == selected_member else Qt.CheckState.Unchecked)
+            self.members.addItem(item)
+        layout.addWidget(self.members)
+        layout.addWidget(label("目标频道"))
+        self.destination = QComboBox()
+        for channel in channels.values():
+            if channel["status"] == "active":
+                self.destination.addItem(channel["name"], channel["channel_id"])
+        index = self.destination.findData(selected_channel)
+        if index >= 0:
+            self.destination.setCurrentIndex(index)
+        layout.addWidget(self.destination)
+        self.feedback = label()
+        layout.addWidget(self.feedback)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("移动所选角色")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_members(self) -> list[str]:
+        return [self.members.item(index).data(Qt.ItemDataRole.UserRole) for index in range(self.members.count())
+                if self.members.item(index).checkState() == Qt.CheckState.Checked]
+
+    def accept(self) -> None:
+        if not self.selected_members():
+            self.feedback.setText("请至少选择一名角色。")
+            return
+        super().accept()
+
+
+class CurrentPageStack(QStackedWidget):
+    """只由当前页面决定窗口最小尺寸，避免工作台撑大选团页。"""
+    def __init__(self) -> None:
+        super().__init__()
+        self.currentChanged.connect(lambda _: self.updateGeometry())
+
+    def sizeHint(self) -> QSize:
+        page = self.currentWidget()
+        return page.sizeHint() if page is not None else QSize()
+
+    def minimumSizeHint(self) -> QSize:
+        page = self.currentWidget()
+        return page.minimumSizeHint() if page is not None else QSize()
+
+
 class HostWindow(QMainWindow):
+    rulesetSelected = Signal(str)
+
     def __init__(self, data_root: Path) -> None:
         super().__init__()
-        self.setWindowTitle("Story · 主机工作台")
-        self.resize(1120, 840)
-        self.setMinimumSize(960, 720)
+        self.setWindowTitle("组织者登录")
+        self.resize(760, 400)
+        self.setMinimumSize(680, 360)
         self.setStyleSheet(STYLE)
         self.data_root = data_root.resolve()
+        self.library = CampaignLibrary(self.data_root)
+        self._available_campaigns: list[dict] = []
+        self._selector_geometry = None
+        self._selector_was_maximized = False
         self.campaign: dict | None = None
         self._job: OperationThread | None = None
         self._busy = False
@@ -179,6 +274,12 @@ class HostWindow(QMainWindow):
         self._channel_drafts: dict[str, tuple[str, tuple[str, str] | None]] = {}
         self._queued_channel_state: dict | None = None
         self._visibility_mode = "secret"
+        self._channel_revision = 0
+        self._member_channels: dict[str, dict] = {}
+        self._pending_reads: dict[str, int] = {}
+        self._channel_refresh_timer = QTimer(self)
+        self._channel_refresh_timer.setSingleShot(True)
+        self._channel_refresh_timer.timeout.connect(self._refresh_channel_status)
         self.server = ServerController(self)
         self.server.stateChanged.connect(self._network_state)
         self.server.errorOccurred.connect(self._report_error)
@@ -194,6 +295,7 @@ class HostWindow(QMainWindow):
         layout.setContentsMargins(20, 18, 20, 14)
         layout.setSpacing(16)
         masthead = QFrame()
+        self.masthead = masthead
         masthead.setObjectName("masthead")
         bar = QHBoxLayout(masthead)
         bar.setContentsMargins(20, 13, 20, 13)
@@ -203,7 +305,8 @@ class HostWindow(QMainWindow):
         self.header_state = label("选择一个团开始", "mastCaption")
         bar.addWidget(self.header_state)
         layout.addWidget(masthead)
-        self.pages = QStackedWidget()
+        masthead.hide()
+        self.pages = CurrentPageStack()
         self.pages.addWidget(self._build_selector())
         self.pages.addWidget(self._build_lobby())
         layout.addWidget(self.pages, 1)
@@ -217,59 +320,48 @@ class HostWindow(QMainWindow):
 
     def _build_selector(self) -> QWidget:
         page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        root_row = QHBoxLayout()
-        root_row.addWidget(label("数据目录"))
-        self.root_field = QLineEdit(str(self.data_root))
-        self.root_field.setReadOnly(True)
-        browse = QPushButton("选择目录")
-        browse.clicked.connect(self._browse_root)
-        self.refresh_button = QPushButton("刷新")
-        self.refresh_button.clicked.connect(self.refresh_campaigns)
-        self.browse_button = browse
-        root_row.addWidget(self.root_field, 1)
-        root_row.addWidget(browse)
-        root_row.addWidget(self.refresh_button)
-        outer.addLayout(root_row)
-
-        columns = QHBoxLayout()
-        existing, existing_layout = panel()
-        existing_layout.addWidget(label("打开已有团", "heading"))
-        self.campaign_list = QListWidget()
-        self.campaign_list.setSpacing(6)
-        self.campaign_list.itemDoubleClicked.connect(self._select_campaign)
-        self.campaign_list.currentRowChanged.connect(self._update_buttons)
-        existing_layout.addWidget(self.campaign_list, 1)
-        self.empty_hint = label("还没有团，可以在右侧新建。", "muted")
-        existing_layout.addWidget(self.empty_hint)
-        self.open_button = QPushButton("进入选中的团")
-        self.open_button.setObjectName("primary")
-        self.open_button.clicked.connect(self._select_campaign)
-        existing_layout.addWidget(self.open_button)
-
+        columns = QHBoxLayout(page)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(20)
+        self.campaign_list = identity_list()
+        self.campaign_list.setAccessibleName("选择团")
+        self.campaign_list.currentItemChanged.connect(self._fill_selected_campaign)
+        self.campaign_list.itemClicked.connect(self._fill_selected_campaign)
+        columns.addWidget(self.campaign_list, 1)
+        right = QVBoxLayout()
+        right.setSpacing(14)
         new, new_layout = panel()
-        new_layout.addWidget(label("新建团", "heading"))
         self.new_name = QLineEdit()
         self.new_name.setMaxLength(200)
-        self.new_name.setPlaceholderText("例如，地下室的来信")
+        self.new_name.textChanged.connect(self._campaign_name_changed)
+        self.new_name.returnPressed.connect(self._select_campaign)
         form = QFormLayout()
+        form.setSpacing(14)
         form.addRow("团名", self.new_name)
-        new_layout.addLayout(form)
-        new_layout.addWidget(label("简介", "muted"))
+        self.rules_choice = QComboBox()
+        self.rules_choice.addItem("coc7", "coc7")
+        self.rules_choice.currentIndexChanged.connect(
+            lambda _: self.rulesetSelected.emit(self.rules_choice.currentData()))
+        form.addRow("规则", self.rules_choice)
         self.new_description = QPlainTextEdit()
         self.new_description.setAccessibleName("简介")
-        self.new_description.setPlaceholderText("写下团本背景或本次跑团的说明")
-        new_layout.addWidget(self.new_description, 1)
-        new_layout.addWidget(label("创建后可在总频道添加角色。", "muted"))
-        self.create_button = QPushButton("新建并进入")
-        self.create_button.setObjectName("primary")
-        self.create_button.clicked.connect(self._create_campaign)
-        new_layout.addWidget(self.create_button)
+        self.new_description.setMinimumHeight(110)
+        form.addRow("简介", self.new_description)
+        new_layout.addLayout(form)
+        right.addWidget(new, 1)
+        buttons = QHBoxLayout()
+        self.manage_button = QPushButton("团管理")
+        self.manage_button.clicked.connect(self._manage_campaigns)
+        self.open_button = QPushButton("进入")
+        self.open_button.setObjectName("primary")
+        self.open_button.clicked.connect(self._select_campaign)
+        self.new_button = QPushButton("新建")
+        self.new_button.clicked.connect(self._clear_campaign_form)
+        for button in (self.manage_button, self.open_button, self.new_button):
+            buttons.addWidget(button, 1)
+        right.addLayout(buttons)
         self.new_panel = new
-        columns.addWidget(existing, 1)
-        columns.addWidget(new, 1)
-        outer.addLayout(columns, 1)
+        columns.addLayout(right, 2)
         return page
 
     def _build_lobby(self) -> QWidget:
@@ -326,16 +418,17 @@ class HostWindow(QMainWindow):
         people_heading = QHBoxLayout()
         people_heading.addWidget(label("人物", "heading"))
         people_heading.addStretch()
-        self.add_button = QPushButton("添加角色")
+        self.add_button = QPushButton("添加角色 / OB")
         self.add_button.clicked.connect(self._add_member)
         people_heading.addWidget(self.add_button)
         people_layout.addLayout(people_heading)
-        self.member_table = QTableWidget(0, 3)
-        self.member_table.setHorizontalHeaderLabels(["身份", "角色名", "密码"])
+        self.member_table = QTableWidget(0, 4)
+        self.member_table.setHorizontalHeaderLabels(["身份", "角色名 / 昵称", "密码", "当前场景"])
         self.member_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.member_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.member_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.member_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.member_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.member_table.verticalHeader().setVisible(False)
         self.member_table.itemSelectionChanged.connect(self._update_buttons)
         people_layout.addWidget(self.member_table, 1)
@@ -343,13 +436,21 @@ class HostWindow(QMainWindow):
         self.edit_button = QPushButton("编辑人物")
         self.edit_button.clicked.connect(self._edit_member)
         member_actions.addWidget(self.edit_button)
+        self.move_members_button = QPushButton("调整角色分组")
+        self.move_members_button.clicked.connect(self._move_members)
+        member_actions.addWidget(self.move_members_button)
         people_layout.addLayout(member_actions)
         self.members_refresh = QPushButton("刷新人物状态")
         self.members_refresh.clicked.connect(self._reload_campaign)
         people_layout.addWidget(self.members_refresh)
 
         channel, channel_layout = panel()
-        channel_layout.addWidget(label("场景与聊天", "heading"))
+        channel_heading = QHBoxLayout()
+        channel_heading.addWidget(label("场景与聊天", "heading"))
+        channel_heading.addStretch()
+        self.unread_summary = label("暂无未读", "muted")
+        channel_heading.addWidget(self.unread_summary)
+        channel_layout.addLayout(channel_heading)
         channel_row = QHBoxLayout()
         self.channel_choice = QComboBox()
         self.channel_choice.currentIndexChanged.connect(self._select_host_channel)
@@ -386,6 +487,7 @@ class HostWindow(QMainWindow):
         self.logs.setFont(QFont("Consolas", 10))
         self.tabs.addTab(history_tab, "频道消息")
         self.tabs.addTab(self.logs, "运行日志")
+        self.tabs.currentChanged.connect(self._queue_current_read)
         channel_layout.addWidget(self.tabs, 1)
         self.message_input = QPlainTextEdit()
         self.message_input.setPlaceholderText("以主持人身份发言")
@@ -436,6 +538,8 @@ class HostWindow(QMainWindow):
             self._populate_channels(state)
         if self._closing and not self.server.active:
             QTimer.singleShot(0, self.close)
+        elif self._returning and not self.server.active and not self._busy:
+            self._return_to_selector()
         elif self._refresh_pending and not self._closing:
             self._reload_campaign()
 
@@ -450,44 +554,106 @@ class HostWindow(QMainWindow):
     def refresh_campaigns(self) -> None:
         def populated(result: tuple) -> None:
             campaigns, errors = result
+            self._available_campaigns = campaigns
+            previous = self.campaign_list.currentItem()
+            selected = previous.data(Qt.ItemDataRole.UserRole) if previous is not None else None
+            self.campaign_list.blockSignals(True)
             self.campaign_list.clear()
             for campaign in campaigns:
-                item = QListWidgetItem(
-                    f"{campaign['name']}\n{campaign['kp_name']} · {len(campaign['members']) - 1} 名玩家"
-                )
-                item.setData(Qt.ItemDataRole.UserRole, campaign["directory"])
-                item.setToolTip(f"<pre>{escape(campaign['description'] or str(campaign['directory']))}</pre>")
-                self.campaign_list.addItem(item)
-            self.empty_hint.setVisible(not campaigns)
-            if campaigns:
+                if not campaign["hidden"]:
+                    add_campaign_card(self.campaign_list, campaign)
+                    if campaign["directory"] == selected:
+                        self.campaign_list.setCurrentRow(self.campaign_list.count() - 1)
+            if self.campaign_list.currentRow() < 0 and self.campaign_list.count():
                 self.campaign_list.setCurrentRow(0)
+            self.campaign_list.blockSignals(False)
+            if self.campaign_list.currentItem() is not None:
+                self._fill_selected_campaign()
+            else:
+                self._clear_campaign_form()
             if errors:
                 self._report_error("部分团读取失败，" + "；".join(errors))
 
-        self._run(lambda: discover_campaigns(self.data_root), populated)
+        self._run(self.library.entries, populated)
 
-    def _browse_root(self) -> None:
-        selected = QFileDialog.getExistingDirectory(self, "选择团数据目录", str(self.data_root))
-        if selected:
-            self.data_root = Path(selected)
-            self.root_field.setText(str(self.data_root))
-            self.refresh_campaigns()
+    def _matching_campaign(self) -> dict | None:
+        name = self.new_name.text().strip()
+        return next((campaign for campaign in self._available_campaigns if campaign["name"] == name), None)
 
-    def _select_campaign(self, *args: object) -> None:
+    def _fill_selected_campaign(self, *_args: object) -> None:
         item = self.campaign_list.currentItem()
-        if item is not None and not self._busy:
-            directory = item.data(Qt.ItemDataRole.UserRole)
-            self._run(lambda: self._read_campaign(directory), self._enter_campaign)
+        if item is None:
+            return
+        directory = item.data(Qt.ItemDataRole.UserRole)
+        campaign = next((value for value in self._available_campaigns if value["directory"] == directory), None)
+        if campaign is not None:
+            self.new_name.blockSignals(True)
+            self.new_name.setText(campaign["name"])
+            self.new_name.blockSignals(False)
+            self._fill_campaign_fields(campaign)
+            self._update_buttons()
 
-    def _create_campaign(self) -> None:
+    def _fill_campaign_fields(self, campaign: dict) -> None:
+        self.new_description.setPlainText(campaign["description"])
+        ruleset = campaign["ruleset"]
+        index = self.rules_choice.findData(ruleset)
+        if index < 0:
+            self.rules_choice.addItem(ruleset, ruleset)
+            index = self.rules_choice.count() - 1
+        self.rules_choice.setCurrentIndex(index)
+
+    def _campaign_name_changed(self, *_args: object) -> None:
+        campaign = self._matching_campaign()
+        self.campaign_list.blockSignals(True)
+        self.campaign_list.setCurrentRow(-1)
+        self.campaign_list.clearSelection()
+        if campaign is not None:
+            for row in range(self.campaign_list.count()):
+                if self.campaign_list.item(row).data(Qt.ItemDataRole.UserRole) == campaign["directory"]:
+                    self.campaign_list.setCurrentRow(row)
+                    break
+            self._fill_campaign_fields(campaign)
+        self.campaign_list.blockSignals(False)
+        self._update_buttons()
+
+    def _clear_campaign_form(self) -> None:
+        self.campaign_list.blockSignals(True)
+        self.campaign_list.setCurrentRow(-1)
+        self.campaign_list.clearSelection()
+        self.campaign_list.blockSignals(False)
+        self.new_name.blockSignals(True)
+        self.new_name.clear()
+        self.new_name.blockSignals(False)
+        self.new_description.clear()
+        self.rules_choice.setCurrentIndex(self.rules_choice.findData("coc7"))
+        self.feedback.clear()
+        self.new_name.setFocus()
+        self._update_buttons()
+
+    def _manage_campaigns(self) -> None:
+        def show_management(result: tuple) -> None:
+            campaigns, errors = result
+            dialog = CampaignManagementDialog(self, self.library, campaigns)
+            if errors:
+                dialog.feedback.setText("；".join(errors))
+            dialog.exec()
+            if dialog.changed:
+                self.refresh_campaigns()
+            dialog.deleteLater()
+
+        self._run(self.library.entries, show_management)
+
+    def _select_campaign(self, *_args: object) -> None:
+        if self._busy or self._closing:
+            return
         name = self.new_name.text()
         description = self.new_description.toPlainText()
 
-        def create() -> tuple[dict, dict]:
-            directory = initialize_campaign(self.data_root, name, description=description)
+        def enter() -> tuple[dict, dict]:
+            directory = self.library.enter(name, description)
             return self._read_campaign(directory)
 
-        self._run(create, self._enter_campaign)
+        self._run(enter, self._enter_campaign)
 
     @staticmethod
     def _read_campaign(directory: Path) -> tuple[dict, dict]:
@@ -496,6 +662,8 @@ class HostWindow(QMainWindow):
         return campaign, local_lobby_history(directory)
 
     def _enter_campaign(self, result: tuple[dict, dict]) -> None:
+        self._selector_geometry = self.geometry()
+        self._selector_was_maximized = self.isMaximized()
         campaign, history = result
         self.campaign = campaign
         self.campaign_title.setText(str(campaign["name"]))
@@ -506,6 +674,8 @@ class HostWindow(QMainWindow):
         self.campaign_description.setVisible(bool(description))
         self.header_state.setText("本地管理 · 监听已关闭")
         self.messages.clear()
+        self._pending_reads.clear()
+        self._channel_refresh_timer.stop()
         self._channel_drafts.clear()
         self._channel_id = campaign["lobby_id"]
         self._populate_channels(campaign["channel_state"])
@@ -513,11 +683,25 @@ class HostWindow(QMainWindow):
         self._retry_send = None
         self.message_input.clear()
         self.pages.setCurrentIndex(1)
+        self.masthead.show()
+        self.setWindowTitle("Story · 主机工作台")
         self._populate_members()
+        self.centralWidget().layout().activate()
+        minimum = self.minimumSizeHint().expandedTo(QSize(960, 720))
+        target = self.size().expandedTo(QSize(1120, 840))
+        screen = self.screen()
+        if screen is not None:
+            limit = screen.availableGeometry().size() - (self.frameGeometry().size() - self.size())
+            minimum = minimum.boundedTo(limit)
+            target = target.boundedTo(limit)
+        self.setMinimumSize(minimum)
+        if not self.isMaximized():
+            self.resize(target.expandedTo(minimum))
 
     def _show_history(self, page: dict) -> None:
         self.messages.add_messages(page["messages"])
         self._history_has_more = page["has_more"]
+        self._queue_current_read()
 
     def _load_older_history(self) -> None:
         before = self.messages.oldest_sequence
@@ -529,14 +713,22 @@ class HostWindow(QMainWindow):
     def _populate_channels(self, state: dict) -> None:
         self._channels = {item["channel_id"]: item for item in state["channels"]}
         self._visibility_mode = state["visibility_mode"]
-        selected = self._next_channel_id or self._channel_id
-        self._next_channel_id = None
+        self._channel_revision = state["revision"]
+        self._member_channels = {item["member_id"]: item for item in state.get("members", [])}
+        selected = self._channel_id
+        if self._next_channel_id in self._channels:
+            selected = self._next_channel_id
+            self._next_channel_id = None
+        elif self._channel_request is None:
+            self._next_channel_id = None
         if selected not in self._channels:
             selected = state["current_channel_id"]
         self.channel_choice.blockSignals(True)
         self.channel_choice.clear()
         for item in state["channels"]:
             suffix = "（归档）" if item["status"] == "archived" else ""
+            if item.get("unread_count", 0):
+                suffix += f" · {item['unread_count']} 未读"
             self.channel_choice.addItem(item["name"] + suffix, item["channel_id"])
         self.channel_choice.setCurrentIndex(self.channel_choice.findData(selected))
         self.channel_choice.blockSignals(False)
@@ -545,6 +737,11 @@ class HostWindow(QMainWindow):
         self.visibility_choice.blockSignals(False)
         if selected != self._channel_id:
             self._select_host_channel(self.channel_choice.currentIndex())
+        unread = [f"{item['name'][:12]} {item['unread_count']} 未读" for item in state["channels"] if item.get("unread_count", 0)]
+        self.unread_summary.setText(" · ".join(unread[:2]) or "暂无未读")
+        self.unread_summary.setToolTip("\n".join(unread))
+        self._update_member_channels()
+        self._queue_current_read()
         self._update_buttons()
 
     def _select_host_channel(self, _index: int) -> None:
@@ -562,14 +759,93 @@ class HostWindow(QMainWindow):
     def _receive_message(self, event: dict) -> None:
         if event.get("channel_id") == self._channel_id:
             self.messages.add_message(event)
+            self._queue_current_read()
+        self._schedule_channel_refresh()
+
+    def _queue_current_read(self, *_args: object) -> None:
+        if self.campaign is None or self.tabs.currentIndex() != 0:
+            return
+        sequence = self.messages.newest_sequence
+        known = self._channels.get(self._channel_id, {}).get("read_sequence", 0)
+        if sequence > max(known, self._pending_reads.get(self._channel_id, 0)):
+            self._pending_reads[self._channel_id] = sequence
+            self._schedule_channel_refresh()
+
+    def _schedule_channel_refresh(self) -> None:
+        if self.campaign is not None and not self._closing and not self._channel_refresh_timer.isActive():
+            self._channel_refresh_timer.start(100)
+
+    def _refresh_channel_status(self) -> None:
+        if self.campaign is None or self._closing or self._returning:
+            return
+        if (self._busy or self._channel_request is not None or QApplication.activeModalWidget() is not None
+                or self.server.state in ("starting", "stopping")):
+            self._schedule_channel_refresh()
+            return
+        reads, self._pending_reads = self._pending_reads, {}
+        if self.server.state == "running":
+            for channel_id, sequence in reads.items():
+                self.server.command("channel.read", channel_id=channel_id, sequence=sequence)
+            if not reads:
+                self.server.command("channels")
+            return
+        if not reads:
+            return
+        directory = self.campaign["directory"]
+
+        def refresh() -> dict:
+            for channel_id, sequence in reads.items():
+                mark_channel_read(directory, channel_id, sequence)
+            return local_channel_state(directory)
+
+        self._run(refresh, self._populate_channels)
+
+    def _update_member_channels(self) -> None:
+        for row in range(self.member_table.rowCount()):
+            member = self.member_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            name = ("全团主持" if member["role"] == "kp" else "全场旁观 · 大厅发言" if member["role"] == "ob"
+                    else self._member_channels.get(member["member_id"], {}).get("channel_name", "大厅"))
+            item = self.member_table.item(row, 3)
+            item.setText(name)
+            item.setToolTip(f"<pre>{escape(name)}</pre>")
+
+    def _flush_pending_reads(self, on_result: Callable) -> bool:
+        if not self._pending_reads or self.campaign is None:
+            return False
+        reads, self._pending_reads = self._pending_reads, {}
+        directory = self.campaign["directory"]
+        self._channel_refresh_timer.stop()
+
+        def save() -> None:
+            for channel_id, sequence in reads.items():
+                mark_channel_read(directory, channel_id, sequence)
+
+        self._run(save, on_result)
+        return True
+
+    def _move_members(self) -> None:
+        member = self._selected_member()
+        selected = member["member_id"] if member is not None else ""
+        revision = self._channel_revision
+        dialog = AssignmentDialog(self, self.campaign["members"], self._channels, self._member_channels,
+                                  selected, self._channel_id)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        members, destination = dialog.selected_members(), dialog.destination.currentData()
+        dialog.deleteLater()
+        if accepted:
+            self._channel_operation("members.move", member_ids=members,
+                                    channel_id=destination, expected_revision=revision)
 
     def _create_scene(self) -> None:
         dialog = SceneDialog(self, self.campaign["members"])
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        name, members = dialog.name.text(), dialog.selected_members()
+        dialog.deleteLater()
+        if not accepted:
             return
         channel_id = str(uuid4())
         self._next_channel_id = channel_id
-        self._channel_operation("scene.create", name=dialog.name.text(), member_ids=dialog.selected_members(),
+        self._channel_operation("scene.create", name=name, member_ids=members,
                                 channel_id=channel_id)
 
     def _archive_scene(self) -> None:
@@ -583,8 +859,8 @@ class HostWindow(QMainWindow):
             self._channel_operation("visibility.set", mode=self.visibility_choice.currentData())
 
     def _channel_operation(self, operation: str, **values: object) -> None:
+        request_id = str(uuid4())
         if self.server.state == "running":
-            request_id = str(uuid4())
             if self.server.command(operation, request_id=request_id, **values):
                 self._channel_request = request_id
                 self.feedback.setText("正在更新场景…")
@@ -599,6 +875,9 @@ class HostWindow(QMainWindow):
                 archive_scene(directory, values["channel_id"])
             elif operation == "visibility.set":
                 set_visibility_mode(directory, values["mode"])
+            elif operation == "members.move":
+                move_members(directory, values["member_ids"], values["channel_id"], request_id=request_id,
+                             expected_revision=values["expected_revision"])
             return local_channel_state(directory)
 
         self._run(update, self._populate_channels)
@@ -631,7 +910,9 @@ class HostWindow(QMainWindow):
             password = member["password"]
             if password is None:
                 password = "本地主持" if member["role"] == "kp" else "旧密码"
-            values = ["KP" if member["role"] == "kp" else "PL", member["actor_name"], password]
+            current = ("全团主持" if member["role"] == "kp" else "全场旁观 · 大厅发言" if member["role"] == "ob"
+                       else self._member_channels.get(member["member_id"], {}).get("channel_name", "大厅"))
+            values = [member["role"].upper(), member["actor_name"], password, current]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.ItemDataRole.UserRole, member)
@@ -661,10 +942,12 @@ class HostWindow(QMainWindow):
         dialog = MemberDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             actor = dialog.actor.text()
+            role = dialog.role.currentData()
+            password = dialog.password.text() if role == "ob" else "123456"
             directory = self.campaign["directory"]
 
             def add() -> dict:
-                add_member(directory, actor)
+                add_member(directory, actor, role=role, password=password)
                 return campaign_details(directory)
 
             self._run(add, self._members_updated)
@@ -769,6 +1052,10 @@ class HostWindow(QMainWindow):
             self._return_to_selector()
 
     def _return_to_selector(self) -> None:
+        if self._pending_reads:
+            self._returning = True
+            self._flush_pending_reads(lambda _: self._return_to_selector())
+            return
         self._returning = False
         self.campaign = None
         self._channels.clear()
@@ -776,23 +1063,39 @@ class HostWindow(QMainWindow):
         self._channel_drafts.clear()
         self._queued_channel_state = None
         self._next_channel_id = None
+        self._member_channels.clear()
+        self._pending_reads.clear()
+        self._channel_refresh_timer.stop()
         self.pages.setCurrentIndex(0)
+        self.masthead.hide()
+        self.setWindowTitle("组织者登录")
+        self.setMinimumSize(680, 360)
+        self.centralWidget().layout().activate()
+        if self._selector_geometry is not None:
+            if self._selector_was_maximized:
+                self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+            else:
+                self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMaximized)
+                self.setGeometry(self._selector_geometry)
+            self._selector_geometry = None
         self.header_state.setText("选择一个团开始")
         self.refresh_campaigns()
 
     def _update_buttons(self, *args: object) -> None:
         available = not self._busy and not self._closing and self._channel_request is None
-        self.open_button.setEnabled(available and self.campaign_list.currentItem() is not None)
-        self.create_button.setEnabled(available)
+        name = self.new_name.text().strip()
+        self.open_button.setText("新建并进入" if name and self._matching_campaign() is None else "进入")
+        self.open_button.setEnabled(available and bool(name))
         self.new_panel.setEnabled(available)
-        self.browse_button.setEnabled(available)
-        self.refresh_button.setEnabled(available)
+        self.campaign_list.setEnabled(available)
+        self.new_button.setEnabled(available)
+        self.manage_button.setEnabled(available)
         self.switch_button.setEnabled(available and not self._returning)
         self.older_button.setEnabled(available and self.campaign is not None and self._history_has_more and not self._returning)
         self.add_button.setEnabled(available)
         self.members_refresh.setEnabled(available)
         selected = self._selected_member()
-        self.edit_button.setEnabled(available and selected is not None and selected["role"] == "pl")
+        self.edit_button.setEnabled(available and selected is not None and selected["role"] in ("pl", "ob"))
         self.listen_host.setEnabled(not self.server.active)
         self.listen_port.setEnabled(not self.server.active)
         self.network_button.setEnabled(self.campaign is not None and self.server.state != "stopping" and not self._closing)
@@ -801,6 +1104,8 @@ class HostWindow(QMainWindow):
         scene_available = available and self.campaign is not None and self._pending_send is None and self.server.state in ("stopped", "running")
         self.channel_choice.setEnabled(scene_available)
         self.create_scene_button.setEnabled(scene_available)
+        has_players = self.campaign is not None and any(member["role"] == "pl" for member in self.campaign["members"])
+        self.move_members_button.setEnabled(scene_available and has_players)
         self.visibility_choice.setEnabled(scene_available)
         self.archive_scene_button.setEnabled(scene_available and channel.get("kind") == "scene" and channel.get("status") == "active")
         self.send_button.setText(f"发送到{channel.get('name', '频道')}")
@@ -822,6 +1127,11 @@ class HostWindow(QMainWindow):
             self.feedback.setText("正在完成本地操作，完成后关闭。")
             event.ignore()
         else:
+            self._closing = True
+            self._channel_refresh_timer.stop()
+            if self._flush_pending_reads(lambda _: None):
+                event.ignore()
+                return
             event.accept()
 
 

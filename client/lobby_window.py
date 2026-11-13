@@ -162,7 +162,7 @@ class LobbyWindow(QWidget):
         connection_row = QHBoxLayout()
         connection_row.addWidget(QLabel("主机地址"))
         connection_row.addWidget(self.address, stretch=1)
-        connection_row.addWidget(QLabel("角色" if self._managed else "昵称"))
+        connection_row.addWidget(QLabel("角色 / 昵称" if self._managed else "昵称"))
         connection_row.addWidget(self.nickname)
         connection_row.addWidget(self.connect_button)
         connection_row.addWidget(self.disconnect_button)
@@ -421,7 +421,10 @@ class LobbyWindow(QWidget):
         if channel is not None and assigned is not None:
             self.history_label.setText(f"{channel['name']}消息")
             suffix = "可发言" if channel["can_send"] else "只读"
-            self.channel_status.setText(f"当前分配 · {assigned['name']}    正在查看 · {channel['name']}（{suffix}）")
+            if self.session is not None and self.session.role == "ob":
+                self.channel_status.setText(f"OB 观众 · 正在查看 {channel['name']}（{suffix}） · 仅大厅可发言")
+            else:
+                self.channel_status.setText(f"当前分配 · {assigned['name']}    正在查看 · {channel['name']}（{suffix}）")
         self._update_send_controls()
 
     def _select_channel(self, _index: int) -> None:

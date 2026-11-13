@@ -1,13 +1,12 @@
 """从一个桌面入口进入玩家端或组织者工作台。"""
 
-from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
-from .player_window import STYLE, PlayerWindow, label
+from .player_window import STYLE, PlayerWindow
 
 
 class RoleWindow(QWidget):
@@ -17,37 +16,20 @@ class RoleWindow(QWidget):
         self._window: QWidget | None = None
         self.setObjectName("player")
         self.setWindowTitle("Story · 选择身份")
-        self.resize(650, 350)
-        self.setMinimumSize(570, 330)
-        self.setStyleSheet(STYLE + """
-            QLabel#wordmark { color: #326b97; font: 600 19px 'Bahnschrift'; }
-            QFrame#organizer { background: #dfe8ef; border: 1px solid #c0d0de; border-radius: 6px; }
-        """)
+        self.resize(420, 176)
+        self.setMinimumSize(320, 160)
+        self.setStyleSheet(STYLE)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 24, 26, 26)
-        layout.setSpacing(14)
-        layout.addWidget(label("STORY", "wordmark"))
-        layout.addWidget(label("今晚，以什么身份入场？", "title"))
-        cards = QHBoxLayout()
-        cards.setSpacing(14)
-        cards.addWidget(self._card("玩家", "选择已用角色，或用角色名加入团。", self._open_player), 1)
-        cards.addWidget(self._card("组织者", "管理团本、角色和主机监听。", self._open_organizer), 1)
-        layout.addLayout(cards, 1)
-
-    def _card(self, title: str, detail: str, opened: Callable[[], None]) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card" if title == "玩家" else "organizer")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(19, 18, 19, 18)
-        layout.addWidget(label(title, "title"))
-        layout.addWidget(label(detail, "muted"))
-        layout.addStretch()
-        button = QPushButton(f"进入{title}端")
-        if title == "玩家":
-            button.setObjectName("primary")
-        button.clicked.connect(opened)
-        layout.addWidget(button)
-        return card
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        for title, opened in (
+            ("作为参与者", self._open_player),
+            ("作为组织者", self._open_organizer),
+        ):
+            button = QPushButton(title)
+            button.setMinimumHeight(48)
+            button.clicked.connect(opened)
+            layout.addWidget(button, 1)
 
     def _open_player(self) -> None:
         self._show_window(PlayerWindow())

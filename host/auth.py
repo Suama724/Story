@@ -64,9 +64,9 @@ def session_for_token(connection: sqlite3.Connection, token: str) -> MemberSessi
         """SELECT s.token_hash, c.id AS campaign_id, c.name AS campaign_name,
                   m.id AS member_id, m.role, a.id AS actor_id, a.name AS actor_name, s.expires_at
            FROM auth_sessions AS s
-           JOIN members AS m ON m.id = s.member_id AND m.role = 'pl'
+           JOIN members AS m ON m.id = s.member_id AND m.role IN ('pl', 'ob')
            JOIN campaigns AS c ON c.id = m.campaign_id
-           JOIN actors AS a ON a.member_id = m.id AND a.kind = 'pc'
+           JOIN actors AS a ON a.member_id = m.id AND a.kind IN ('pc', 'ob')
            WHERE s.token_hash = ?""",
         (_token_hash(token),),
     ).fetchone()
@@ -79,22 +79,24 @@ class AuthService:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
 
-    def login(self, campaign_name: str, actor_name: str, password: str) -> dict[str, object]:
+    def login(self, campaign_name: str, actor_name: str, password: str, role: str = "pl") -> dict[str, object]:
         with open_campaign(self.directory) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if campaign_name.strip() != campaign_info(connection)["name"]:
                     raise AuthError("campaign_mismatch", "角色信息错误", 400)
                 credential = connection.execute(
-                    """SELECT m.id AS member_id, c.password, c.password_hash
+                    """SELECT m.id AS member_id, m.role, c.password, c.password_hash
                        FROM actors AS a
-                       JOIN members AS m ON m.id = a.member_id AND m.role = 'pl'
+                       JOIN members AS m ON m.id = a.member_id AND m.role IN ('pl', 'ob')
                        LEFT JOIN credentials AS c ON c.member_id = m.id
-                       WHERE a.kind = 'pc' AND a.name = ? COLLATE NOCASE""",
+                       WHERE a.kind IN ('pc', 'ob') AND a.name = ? COLLATE NOCASE""",
                     (actor_name.strip(),),
                 ).fetchone()
                 if credential is None:
                     raise AuthError("actor_not_found", "角色信息错误")
+                if role not in ("pl", "ob") or credential["role"] != role:
+                    raise AuthError("role_mismatch", "身份不匹配，请选择正确的 PL 或 OB。", 400)
                 if not 1 <= len(password) <= 256 or not _password_matches(password, credential):
                     raise AuthError("invalid_credentials", "密码错误")
                 member_id = credential["member_id"]
@@ -147,3 +149,21 @@ class AuthService:
                 session = session_for_token(connection, token)
                 connection.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (session.token_hash,))
         return session.member_id
+
+    def change_nickname(self, token: str, nickname: str) -> dict[str, object]:
+        from .management import _check_name
+        from .storage import member_name
+
+        with open_campaign(self.directory) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = session_for_token(connection, token)
+            if session.role != "ob":
+                raise AuthError("nickname_forbidden", "只有 OB 可以自行修改昵称。", 403)
+            try:
+                nickname = member_name(nickname)
+                _check_name(connection, nickname, session.member_id)
+            except ValueError as error:
+                raise AuthError("invalid_nickname", str(error), 400) from error
+            connection.execute("UPDATE members SET name = ? WHERE id = ?", (nickname, session.member_id))
+            connection.execute("UPDATE actors SET name = ? WHERE member_id = ? AND kind = 'ob'", (nickname, session.member_id))
+            return session_for_token(connection, token).public_info()

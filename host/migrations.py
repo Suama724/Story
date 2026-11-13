@@ -3,7 +3,21 @@
 import sqlite3
 
 APPLICATION_ID = 0x53545259  # STRY
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
+
+
+def _preserve_identity_triggers(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE TEMP TABLE identity_triggers_v7 AS SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN ('members', 'actors')")
+
+
+def _finish_identity_rebuild(connection: sqlite3.Connection) -> None:
+    for row in connection.execute("SELECT sql FROM identity_triggers_v7").fetchall():
+        connection.execute(row[0])
+    connection.execute("DROP TABLE identity_triggers_v7")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise sqlite3.IntegrityError("身份迁移后的外键检查失败。")
+    # SQLite 的延迟 DROP 检查仍记录原表的删除；完整检查通过后恢复即时约束。
+    connection.execute("PRAGMA defer_foreign_keys = OFF")
 
 
 def _unique_character_names(connection: sqlite3.Connection) -> None:
@@ -146,6 +160,47 @@ MIGRATIONS = (
         """CREATE UNIQUE INDEX one_active_scene_per_member ON channel_memberships(member_id)
            WHERE end_sequence IS NULL""",
         "CREATE INDEX channel_participants ON channel_memberships(channel_id, member_id)",
+    ),
+    (
+        """CREATE TABLE channel_read_positions (
+            member_id TEXT NOT NULL REFERENCES members(id),
+            channel_id TEXT NOT NULL REFERENCES channels(id),
+            sequence INTEGER NOT NULL CHECK (sequence >= 0),
+            PRIMARY KEY (member_id, channel_id)
+        )""",
+        """CREATE TABLE channel_operations (
+            request_id TEXT PRIMARY KEY NOT NULL,
+            payload TEXT NOT NULL
+        )""",
+    ),
+    (
+        # 延迟检查引用，重建 CHECK 约束时保留所有既有 ID 和外键。
+        _preserve_identity_triggers,
+        "PRAGMA defer_foreign_keys = ON",
+        """CREATE TABLE members_v7 (
+            id TEXT PRIMARY KEY NOT NULL,
+            campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+            name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+            role TEXT NOT NULL CHECK (role IN ('kp', 'pl', 'ob')),
+            created_at TEXT NOT NULL
+        )""",
+        "INSERT INTO members_v7 SELECT * FROM members",
+        "DROP TABLE members",
+        "ALTER TABLE members_v7 RENAME TO members",
+        "CREATE UNIQUE INDEX one_kp_per_campaign ON members(campaign_id) WHERE role = 'kp'",
+        """CREATE TABLE actors_v7 (
+            id TEXT PRIMARY KEY NOT NULL,
+            member_id TEXT NOT NULL REFERENCES members(id),
+            name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+            kind TEXT NOT NULL CHECK (kind IN ('kp', 'pc', 'npc', 'ob')),
+            created_at TEXT NOT NULL
+        )""",
+        "INSERT INTO actors_v7 SELECT * FROM actors",
+        "DROP TABLE actors",
+        "ALTER TABLE actors_v7 RENAME TO actors",
+        """CREATE UNIQUE INDEX unique_character_name ON actors(name COLLATE NOCASE)
+           WHERE kind IN ('kp', 'pc', 'ob')""",
+        _finish_identity_rebuild,
     ),
 )
 

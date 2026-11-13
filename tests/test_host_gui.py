@@ -14,12 +14,14 @@ from urllib.request import ProxyHandler, Request, build_opener
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from websockets.asyncio.client import connect
 
 from chat_protocol import HISTORY_PAGE_SIZE
 from host.auth import AuthService, DEFAULT_PASSWORD
-from host.host_window import HostWindow, SceneDialog
+from host.host_window import AssignmentDialog, HostWindow, SceneDialog
+from host.campaign_dialogs import CampaignManagementDialog, DeleteCampaignDialog
+from host.channels import create_scene, local_channel_state
 from client.player_window import PlayerWindow
 from host.management import add_member, campaign_details, discover_campaigns, edit_member
 from host.messages import save_lobby_message
@@ -46,6 +48,7 @@ class HostGuiTests(unittest.TestCase):
         self.wait_until(lambda: not self.window.server.active, timeout=10)
         self.wait_until(lambda: not self.window._busy)
         self.window.close()
+        self.wait_until(lambda: not self.window._busy)
         self.window.deleteLater()
         self.app.processEvents()
         self.temporary.cleanup()
@@ -60,10 +63,10 @@ class HostGuiTests(unittest.TestCase):
                 self.fail(f"等待超时，{self.window.feedback.text()}\n{self.window.logs.toPlainText()}")
             time.sleep(0.01)
 
-    def create_from_form(self) -> dict:
-        self.window.new_name.setText("主机调试团 🎲")
+    def create_from_form(self, name="主机调试团 🎲") -> dict:
+        self.window.new_name.setText(name)
         self.window.new_description.setPlainText("团本简介\n第二行")
-        self.window.create_button.click()
+        self.window.open_button.click()
         self.wait_until(lambda: not self.window._busy)
         self.assertEqual(self.window.pages.currentIndex(), 1, self.window.feedback.text())
         return self.window.campaign
@@ -106,7 +109,7 @@ class HostGuiTests(unittest.TestCase):
 
     def test_blank_campaign_name_leaves_no_partial_campaign(self) -> None:
         self.window.new_name.setText("  ")
-        self.window.create_button.click()
+        self.window.open_button.click()
         self.wait_until(lambda: not self.window._busy)
         self.assertEqual(self.window.pages.currentIndex(), 0)
         self.assertEqual(discover_campaigns(self.root)[0], [])
@@ -136,9 +139,94 @@ class HostGuiTests(unittest.TestCase):
 
         self.window.switch_button.click()
         self.wait_until(lambda: not self.window._busy)
-        other = self.create_from_form()
+        other = self.create_from_form("另一场调查")
         self.assertNotEqual(other["campaign_id"], campaign["campaign_id"])
         self.assertEqual(self.window.messages.toPlainText(), "")
+
+    def test_selector_same_name_reuses_campaign_and_rules_only_emit_signal(self) -> None:
+        self.window.show()
+        self.app.processEvents()
+        selector_geometry = self.window.geometry()
+        self.assertTrue(self.window.masthead.isHidden())
+        campaign = self.create_from_form()
+        self.assertGreater(self.window.height(), selector_geometry.height())
+        add_member(campaign["directory"], "角色")
+        add_member(campaign["directory"], "观众", role="ob")
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window.geometry(), selector_geometry)
+        self.assertIn("PL: 1 人   OB: 1 人", self.window.campaign_list.item(0).text())
+        self.assertEqual(self.window.new_name.text(), campaign["name"])
+        self.assertEqual(self.window.open_button.text(), "进入")
+        self.window.new_button.click()
+        self.assertEqual(self.window.new_name.text(), "")
+        self.assertEqual(self.window.new_description.toPlainText(), "")
+        self.assertEqual(self.window.rules_choice.currentData(), "coc7")
+        self.assertIsNone(self.window.campaign_list.currentItem())
+        self.window.new_name.setText("新名字")
+        self.assertEqual(self.window.open_button.text(), "新建并进入")
+        self.window.new_name.setText(campaign["name"])
+        self.assertEqual(self.window.open_button.text(), "进入")
+        events = []
+        self.window.rulesetSelected.connect(events.append)
+        self.window.rules_choice.addItem("未来规则", "future")
+        self.window.rules_choice.setCurrentIndex(1)
+        self.assertEqual(events, ["future"])
+        self.window.new_description.setPlainText("不能覆盖已有团简介")
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window.campaign["campaign_id"], campaign["campaign_id"])
+        self.assertEqual(self.window.campaign["description"], campaign["description"])
+        self.assertEqual(self.window.campaign["ruleset"], "coc7")
+        self.assertEqual(len(discover_campaigns(self.root)[0]), 1)
+
+    def test_campaign_management_can_hide_then_explicitly_delete_archive(self) -> None:
+        campaign = self.create_from_form()
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+
+        def manage(delete_archive):
+            dialog = self.window.findChild(CampaignManagementDialog)
+            if dialog is None:
+                QTimer.singleShot(10, lambda: manage(delete_archive))
+                return
+            self.assertEqual(dialog.archive_field.text(), str(campaign["directory"]))
+            self.assertFalse(dialog.import_button.isEnabled())
+
+            def confirm():
+                confirmation = dialog.findChild(DeleteCampaignDialog)
+                self.assertFalse(confirmation.delete_archive.isChecked())
+                confirmation.delete_archive.setChecked(delete_archive)
+                confirmation.accept()
+
+            QTimer.singleShot(0, confirm)
+            dialog.delete_button.click()
+            dialog.accept()
+
+        QTimer.singleShot(0, lambda: manage(False))
+        self.window.manage_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window.campaign_list.count(), 0)
+        self.assertTrue(campaign["directory"].exists())
+        self.app.sendPostedEvents(None, 0)
+        self.app.processEvents()
+        QTimer.singleShot(0, lambda: manage(True))
+        self.window.manage_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertFalse(campaign["directory"].exists())
+        self.assertEqual(discover_campaigns(self.root)[0], [])
+
+    def test_cancelling_campaign_deletion_preserves_archive_and_visibility(self) -> None:
+        campaign = self.create_from_form()
+        entries, _ = self.window.library.entries()
+        dialog = CampaignManagementDialog(self.window, self.window.library, entries)
+        with patch.object(DeleteCampaignDialog, "exec", return_value=QDialog.DialogCode.Rejected):
+            dialog.delete_button.click()
+        self.assertFalse(dialog.changed)
+        self.assertTrue(campaign["directory"].exists())
+        self.assertFalse(self.window.library.entries()[0][0]["hidden"])
+        self.assertEqual(campaign_details(campaign["directory"])["campaign_id"], campaign["campaign_id"])
+        dialog.deleteLater()
 
     def test_start_stop_restart_and_live_member_edit(self) -> None:
         campaign = self.create_from_form()
@@ -184,14 +272,16 @@ class HostGuiTests(unittest.TestCase):
         original_ack = asyncio.run(chat())
         self.wait_until(lambda: "调查员甲离开了" in self.window.logs.toPlainText())
         logs = self.window.logs.toPlainText().splitlines()
-        self.assertEqual(logs[-2:], ["调查员甲加入了", "调查员甲离开了"])
+        # Windows 关闭网络连接时可能同时输出诊断日志，单独核对成员事件的次数与顺序。
+        member_events = [line for line in logs if line in ("调查员甲加入了", "调查员甲离开了")]
+        self.assertEqual(member_events, ["调查员甲加入了", "调查员甲离开了"])
         self.wait_until(lambda: "主持人调试消息" in self.window.messages.toPlainText())
         self.wait_until(lambda: not self.window.message_input.toPlainText())
         self.assertEqual(self.window.messages.toPlainText().count("主持人调试消息"), 1)
         self.wait_until(lambda: self.window.member_table.item(1, 2).text() == "654321")
         for _ in range(2):
             self.window.network_button.click()
-            self.wait_until(lambda: self.window.server.state == "stopped")
+            self.wait_until(lambda: self.window.server.state == "stopped" and not self.window._busy)
             self.assertTrue(self.window.add_button.isEnabled())
             self.assertEqual(campaign_details(campaign["directory"])["campaign_id"], campaign["campaign_id"])
             self.window.network_button.click()
@@ -354,6 +444,167 @@ class HostGuiTests(unittest.TestCase):
         self.wait_until(lambda: "地下室线索 🎲" in a.chat_history.toPlainText())
         self.assertFalse(a.send_button.isEnabled())
         self.assertEqual(a.message.toPlainText(), "地下室草稿")
+
+    def test_four_players_transfer_between_parallel_scenes_and_kp_reads_unread(self) -> None:
+        campaign = self.create_from_form()
+        member_ids = {name: add_member(campaign["directory"], name) for name in ("A", "B", "C", "D")}
+        self.window.members_refresh.click()
+        self.wait_until(lambda: not self.window._busy)
+        port = self.start_listener()
+        for name in member_ids:
+            player = PlayerWindow(QSettings(str(self.root / f"{name}.ini"), QSettings.Format.IniFormat))
+            self.players.append(player)
+            player.address.setText(f"ws://127.0.0.1:{port}/ws/lobby")
+            player.campaign_name.setText(campaign["name"])
+            player.actor_name.setText(name)
+            player.password.setText(DEFAULT_PASSWORD)
+            player.login_button.click()
+            self.wait_until(lambda: player.lobby is not None and player.lobby._channel_state_ready)
+        a, b, c, d = (player.lobby for player in self.players)
+
+        def create_group(name, members):
+            self.wait_until(self.window.create_scene_button.isEnabled)
+
+            def fill():
+                dialog = QApplication.activeModalWidget()
+                dialog.name.setText(name)
+                for index in range(dialog.members.count()):
+                    item = dialog.members.item(index)
+                    item.setCheckState(Qt.CheckState.Checked if item.data(Qt.ItemDataRole.UserRole) in members else Qt.CheckState.Unchecked)
+                dialog.accept()
+                # 模拟未读刷新在创建请求之前已发出、响应尚未到达的顺序。
+                self.window.server.command("channels")
+
+            QTimer.singleShot(0, fill)
+            self.window.create_scene_button.click()
+            self.wait_until(lambda: self.window._channel_request is None and not self.window._busy)
+            return next(item["channel_id"] for item in self.window._channels.values() if item["name"] == name)
+
+        def move(members, destination):
+            self.wait_until(self.window.move_members_button.isEnabled)
+
+            def fill():
+                dialog = QApplication.activeModalWidget()
+                for index in range(dialog.members.count()):
+                    item = dialog.members.item(index)
+                    item.setCheckState(Qt.CheckState.Checked if item.data(Qt.ItemDataRole.UserRole) in members else Qt.CheckState.Unchecked)
+                dialog.destination.setCurrentIndex(dialog.destination.findData(destination))
+                dialog.accept()
+
+            QTimer.singleShot(0, fill)
+            self.window.move_members_button.click()
+            self.wait_until(lambda: self.window._channel_request is None and not self.window._busy
+                            and all(self.window._member_channels[item]["channel_id"] == destination for item in members))
+
+        def say(lobby, text):
+            self.wait_until(lobby.send_button.isEnabled)
+            lobby.message.setPlainText(text)
+            lobby.send_button.click()
+            self.wait_until(lambda: not lobby._awaiting_send and text in lobby.chat_history.toPlainText())
+
+        basement = create_group("地下室", [member_ids["A"], member_ids["B"]])
+        lounge = create_group("客厅", [member_ids["C"], member_ids["D"]])
+        self.wait_until(lambda: a._assigned_channel_id == basement and b._assigned_channel_id == basement
+                        and c._assigned_channel_id == lounge and d._assigned_channel_id == lounge)
+        self.assertEqual(self.window._channel_id, lounge)
+        say(a, "地下室第一条")
+        say(b, "地下室第二条")
+        say(c, "客厅早期线索")
+        say(d, "客厅另一条早期线索")
+        self.wait_until(lambda: self.window._channels[basement]["unread_count"] == 2
+                        and self.window._channels[lounge]["unread_count"] == 0)
+        self.assertIn("地下室 2 未读", self.window.unread_summary.text())
+        self.assertNotIn("客厅早期线索", a.chat_history.toPlainText())
+        self.assertNotIn("地下室第一条", c.chat_history.toPlainText())
+        b.message.setPlainText("地下室保留的草稿")
+        move([member_ids["B"]], lounge)
+        self.wait_until(lambda: b._assigned_channel_id == lounge and b._history_request is None)
+        self.assertNotIn("客厅早期线索", b.chat_history.toPlainText())
+        self.assertEqual(b.message.toPlainText(), "")
+        say(a, "B 离开后的秘密")
+        say(c, "B 加入后的客厅线索")
+        self.wait_until(lambda: "B 加入后的客厅线索" in b.chat_history.toPlainText())
+        self.assertNotIn("B 离开后的秘密", b.chat_history.toPlainText())
+        say(b, "在客厅发言")
+        move([member_ids["B"]], basement)
+        self.wait_until(lambda: b._assigned_channel_id == basement and b._history_request is None)
+        self.assertEqual(b.message.toPlainText(), "地下室保留的草稿")
+        say(a, "B 重返后的线索")
+        self.wait_until(lambda: "B 重返后的线索" in b.chat_history.toPlainText())
+        self.assertIn("地下室第一条", b.chat_history.toPlainText())
+        self.assertNotIn("B 离开后的秘密", b.chat_history.toPlainText())
+        self.assertEqual([item["sequence"] for item in b._cache.page()], [1, 2, 4])
+
+        d.disconnect_button.click()
+        self.wait_until(lambda: d.connect_button.isEnabled())
+        move([member_ids["D"]], basement)
+        d.connect_button.click()
+        self.wait_until(lambda: d._channel_state_ready and d._assigned_channel_id == basement)
+        say(a, "D 加入后的线索")
+        self.wait_until(lambda: "D 加入后的线索" in d.chat_history.toPlainText())
+        self.assertNotIn("B 重返后的线索", d.chat_history.toPlainText())
+
+        move([member_ids["B"]], campaign["lobby_id"])
+        self.wait_until(lambda: b._assigned_channel_id == campaign["lobby_id"])
+        say(b, "我回到大厅了")
+        self.wait_until(lambda: self.window._channels[basement]["unread_count"] == 5)
+        self.window.channel_choice.setCurrentIndex(self.window.channel_choice.findData(basement))
+        self.wait_until(lambda: self.window._channels[basement]["unread_count"] == 0 and not self.window._busy)
+        self.assertIn("D 加入后的线索", self.window.messages.toPlainText())
+        stored = next(item for item in local_channel_state(campaign["directory"])["channels"] if item["channel_id"] == basement)
+        self.assertEqual(stored["read_sequence"], 5)
+        for row in range(self.window.member_table.rowCount()):
+            if self.window.member_table.item(row, 1).text() == "B":
+                self.assertEqual(self.window.member_table.item(row, 3).text(), "大厅")
+
+    def test_offline_move_and_unread_survive_reopening_campaign(self) -> None:
+        campaign = self.create_from_form()
+        member = add_member(campaign["directory"], "A")
+        first = create_scene(campaign["directory"], "地下室", [member])
+        second = create_scene(campaign["directory"], "客厅", [])
+        token = AuthService(campaign["directory"]).login(campaign["name"], "A", DEFAULT_PASSWORD)["token"]
+        save_lobby_message(campaign["directory"], "offline-unread", "未读线索", token=token, channel_id=first)
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window._channels[first]["unread_count"], 1)
+
+        def fill():
+            dialog = self.window.findChild(AssignmentDialog)
+            dialog.members.item(0).setCheckState(Qt.CheckState.Checked)
+            dialog.destination.setCurrentIndex(dialog.destination.findData(second))
+            dialog.accept()
+
+        QTimer.singleShot(0, fill)
+        self.window.move_members_button.click()
+        self.wait_until(lambda: not self.window._busy and self.window._member_channels[member]["channel_id"] == second)
+        self.assertFalse(self.window.server.active)
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.assertEqual(self.window._member_channels[member]["channel_id"], second)
+        self.assertEqual(self.window._channels[first]["unread_count"], 1)
+        self.window.channel_choice.setCurrentIndex(self.window.channel_choice.findData(first))
+        self.wait_until(lambda: self.window._channels[first]["unread_count"] == 0 and not self.window._busy)
+
+    def test_opening_channel_then_immediately_switching_campaign_flushes_read_position(self) -> None:
+        campaign = self.create_from_form()
+        member = add_member(campaign["directory"], "A")
+        scene = create_scene(campaign["directory"], "地下室", [member])
+        token = AuthService(campaign["directory"]).login(campaign["name"], "A", DEFAULT_PASSWORD)["token"]
+        save_lobby_message(campaign["directory"], "read-before-switch", "读后立即切团", token=token, channel_id=scene)
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.open_button.click()
+        self.wait_until(lambda: not self.window._busy)
+        self.window.channel_choice.setCurrentIndex(self.window.channel_choice.findData(scene))
+        self.wait_until(lambda: not self.window._busy)
+        self.window.switch_button.click()
+        self.wait_until(lambda: not self.window._busy and self.window.campaign is None)
+        state = next(item for item in local_channel_state(campaign["directory"])["channels"] if item["channel_id"] == scene)
+        self.assertEqual(state["unread_count"], 0)
 
 
 if __name__ == "__main__":

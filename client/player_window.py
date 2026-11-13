@@ -1,13 +1,14 @@
 """角色登录、登录记忆与大厅中的密码修改。"""
 
 from pathlib import Path
+from dataclasses import replace
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, QSize, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QInputDialog, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QInputDialog, QListWidget, QListWidgetItem, QPushButton, QRadioButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .auth_client import AuthClient, ClientSession, server_urls
@@ -20,6 +21,7 @@ LOGIN_ERRORS = {
     "campaign_mismatch": "角色信息错误",
     "actor_not_found": "角色信息错误",
     "invalid_credentials": "密码错误",
+    "role_mismatch": "身份不匹配，请选择正确的 PL 或 OB。",
 }
 
 STYLE = """
@@ -87,13 +89,82 @@ class PasswordDialog(QDialog):
             super().accept()
 
 
+def identity_caption(record: dict) -> str:
+    return f"[{record['campaign_name']}]-{record.get('role', 'pl').upper()}-{record['actor_name']}"
+
+
+def add_identity_card(widget: QListWidget, record: dict) -> None:
+    item = QListWidgetItem(f"{record['campaign_name']}\n{record.get('role', 'pl').upper()} - {record['actor_name']}")
+    item.setData(Qt.ItemDataRole.UserRole, record)
+    item.setData(Qt.ItemDataRole.AccessibleTextRole, identity_caption(record))
+    item.setToolTip(identity_caption(record))
+    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+    item.setSizeHint(QSize(180, 76))
+    widget.addItem(item)
+
+
+IDENTITY_STYLE = """
+QListWidget { background: white; border: 1px solid #ccd6df; border-radius: 6px; padding: 6px; outline: none; }
+QListWidget::item { background: #f6f8fa; border: 1px solid #ccd6df; border-radius: 4px; padding: 8px; }
+QListWidget::item:selected { background: #e6eff7; border-color: #326b97; color: #203548; }
+"""
+
+
+def identity_list() -> QListWidget:
+    widget = QListWidget()
+    widget.setStyleSheet(IDENTITY_STYLE)
+    widget.setSpacing(6)
+    widget.setWordWrap(True)
+    widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    return widget
+
+
+class IdentityManagementDialog(QDialog):
+    def __init__(self, parent: QWidget, history: LoginHistory) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("身份管理")
+        self.resize(380, 420)
+        self.history = history
+        self.changed = False
+        layout = QVBoxLayout(self)
+        self.identities = identity_list()
+        self.identities.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for record in history.entries():
+            add_identity_card(self.identities, record)
+        layout.addWidget(self.identities, 1)
+        self.feedback = label()
+        layout.addWidget(self.feedback)
+        buttons = QHBoxLayout()
+        self.delete_button = QPushButton("删除所选身份")
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._delete_selected)
+        self.identities.itemSelectionChanged.connect(
+            lambda: self.delete_button.setEnabled(bool(self.identities.selectedItems())))
+        buttons.addWidget(self.delete_button)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def _delete_selected(self) -> None:
+        for item in self.identities.selectedItems():
+            record = item.data(Qt.ItemDataRole.UserRole)
+            if not self.history.delete(record):
+                self.feedback.setText("身份删除失败，请关闭后重试。")
+                return
+            self.identities.takeItem(self.identities.row(item))
+            self.changed = True
+        self.feedback.setText("已删除本机保存的登录身份。")
+
+
 class PlayerWindow(QWidget):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self.setObjectName("player")
-        self.setWindowTitle("Story · 玩家登录")
-        self.resize(780, 620)
-        self.setMinimumSize(680, 540)
+        self.setWindowTitle("参与者登录")
+        self.resize(760, 386)
+        self.setMinimumSize(680, 360)
         self.setStyleSheet(STYLE)
         self.auth = AuthClient(self)
         self.auth.completed.connect(self._auth_completed)
@@ -107,22 +178,29 @@ class PlayerWindow(QWidget):
         self._http = None
         self._websocket = None
         self._drafts: dict[tuple[str, str], dict] = {}
+        self._login_geometry = None
+        self._login_minimum_size = self.minimumSize()
+        self._login_was_maximized = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
-        layout.setSpacing(16)
-        header = QHBoxLayout()
-        header.addWidget(label("STORY", "title"))
-        header.addStretch()
-        self.identity = label("以角色身份加入跑团", "muted")
+        layout.setSpacing(12)
+        self.header = QWidget()
+        header = QHBoxLayout(self.header)
+        header.setContentsMargins(0, 0, 0, 0)
+        self.identity = label("", "muted")
         header.addWidget(self.identity)
+        header.addStretch()
         self.logout_button = QPushButton("退出登录")
         self.logout_button.clicked.connect(self._logout)
         self.change_button = QPushButton("修改密码")
         self.change_button.clicked.connect(self._change_password)
+        self.nickname_button = QPushButton("修改昵称")
+        self.nickname_button.clicked.connect(self._change_nickname)
+        header.addWidget(self.nickname_button)
         header.addWidget(self.change_button)
         header.addWidget(self.logout_button)
-        layout.addLayout(header)
+        layout.addWidget(self.header)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._login_page())
         layout.addWidget(self.pages, 1)
@@ -131,78 +209,118 @@ class PlayerWindow(QWidget):
         self._load_history()
         self._update_controls()
 
-    def _card(self, title: str) -> tuple[QWidget, QVBoxLayout]:
+    def _login_page(self) -> QWidget:
         page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.addStretch()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(20)
+        self.saved_logins = identity_list()
+        self.saved_logins.setAccessibleName("选择身份")
+        self.saved_logins.currentItemChanged.connect(self._select_saved_login)
+        self.saved_logins.itemClicked.connect(self._select_saved_login)
+        layout.addWidget(self.saved_logins, 1)
+        right = QVBoxLayout()
+        right.setSpacing(14)
         card = QFrame()
         card.setObjectName("card")
-        contents = QVBoxLayout(card)
-        contents.setContentsMargins(26, 24, 26, 24)
-        contents.setSpacing(18)
-        contents.addWidget(label(title, "title"))
-        outer.addWidget(card)
-        outer.addStretch()
-        return page, contents
-
-    def _login_page(self) -> QWidget:
-        page, layout = self._card("加入")
-        self.saved_logins = QComboBox()
-        self.saved_logins.currentIndexChanged.connect(self._select_saved_login)
-        self.address = QLineEdit(DEFAULT_ADDRESS)
+        form = QFormLayout(card)
+        form.setContentsMargins(22, 20, 22, 20)
+        form.setSpacing(14)
+        self.address = QLineEdit()
+        self.address.setPlaceholderText(DEFAULT_ADDRESS)
         self.campaign_name = QLineEdit()
         self.campaign_name.setPlaceholderText("组织者当前开启的团名")
         self.actor_name = QLineEdit()
         self.actor_name.setMaxLength(160)
-        self.actor_name.setPlaceholderText("组织者在团里创建的角色名")
+        self.actor_name.setPlaceholderText("PL 填角色名，OB 填组织者创建的昵称")
         self.password = QLineEdit()
         self.password.setMaxLength(512)
-        self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("新角色默认密码为 123456")
-        self.remember_password = QCheckBox("记住密码")
-        form = QFormLayout()
-        form.setSpacing(12)
-        form.addRow("选择角色", self.saved_logins)
-        form.addRow("主机地址与端口", self.address)
+        role_row = QHBoxLayout()
+        self.pl_role = QRadioButton("PL")
+        self.ob_role = QRadioButton("OB")
+        self.role_group = QButtonGroup(self)
+        self.role_group.addButton(self.pl_role, 0)
+        self.role_group.addButton(self.ob_role, 1)
+        self.pl_role.setChecked(True)
+        role_row.addWidget(self.pl_role)
+        role_row.addWidget(self.ob_role)
+        role_row.addStretch()
         form.addRow("团名", self.campaign_name)
-        form.addRow("角色名", self.actor_name)
+        form.addRow("身份", role_row)
+        form.addRow("名称", self.actor_name)
         form.addRow("密码", self.password)
-        layout.addLayout(form)
+        form.addRow("组织方地址", self.address)
+        right.addWidget(card, 1)
         buttons = QHBoxLayout()
-        self.login_button = QPushButton("进入大厅")
+        self.manage_button = QPushButton("身份管理")
+        self.manage_button.clicked.connect(self._manage_identities)
+        self.login_button = QPushButton("登入")
         self.login_button.setObjectName("primary")
         self.login_button.clicked.connect(self._login)
         self.password.returnPressed.connect(self._login)
         self.actor_name.returnPressed.connect(self._login)
-        buttons.addWidget(self.remember_password)
-        buttons.addStretch()
-        buttons.addWidget(self.login_button)
-        layout.addLayout(buttons)
+        self.new_identity_button = QPushButton("新身份")
+        self.new_identity_button.clicked.connect(self._new_identity)
+        for button in (self.manage_button, self.login_button, self.new_identity_button):
+            buttons.addWidget(button, 1)
+        right.addLayout(buttons)
+        layout.addLayout(right, 2)
         return page
 
-    def _load_history(self) -> None:
+    def _load_history(self, selected: dict | None = None, *, select_first: bool = True) -> None:
         self.saved_logins.blockSignals(True)
         self.saved_logins.clear()
+        selected_row = -1
         for record in self.history.entries():
-            self.saved_logins.addItem(f"[{record['campaign_name']}]-{record['actor_name']}", record)
-        self.saved_logins.addItem("新登录")
-        self.saved_logins.setCurrentIndex(0)
+            add_identity_card(self.saved_logins, record)
+            if selected is not None and record == selected:
+                selected_row = self.saved_logins.count() - 1
+        if selected_row < 0 and select_first and self.saved_logins.count():
+            selected_row = 0
+        self.saved_logins.setCurrentRow(selected_row)
         self.saved_logins.blockSignals(False)
         self._select_saved_login()
 
-    def _select_saved_login(self) -> None:
-        record = self.saved_logins.currentData()
-        self.address.setText(record["address"] if record else DEFAULT_ADDRESS)
+    def _selected_role(self) -> str:
+        return "ob" if self.ob_role.isChecked() else "pl"
+
+    def _selected_record(self) -> dict | None:
+        item = self.saved_logins.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+
+    def _select_saved_login(self, *_args: object) -> None:
+        record = self._selected_record()
+        self.address.setText(record["address"] if record else "")
         self.campaign_name.setText(record["campaign_name"] if record else "")
         self.actor_name.setText(record["actor_name"] if record else "")
-        self.password.setText(record["password"] if record else "123456")
-        self.remember_password.setChecked(record is None or bool(record["password"]))
+        self.password.setText(record["password"] if record else "")
+        selected_role = self.ob_role if record and record.get("role", "pl") == "ob" else self.pl_role
+        selected_role.setChecked(True)
+
+    def _new_identity(self) -> None:
+        self.saved_logins.setCurrentRow(-1)
+        self.saved_logins.clearSelection()
+        for field in (self.campaign_name, self.actor_name, self.password, self.address):
+            field.clear()
+        self.pl_role.setChecked(True)
+        self.feedback.clear()
+        self.campaign_name.setFocus()
+
+    def _manage_identities(self) -> None:
+        selected = self._selected_record()
+        dialog = IdentityManagementDialog(self, self.history)
+        dialog.exec()
+        if dialog.changed:
+            self._load_history(selected, select_first=False)
+        dialog.deleteLater()
 
     def _saved_profile(self) -> dict | None:
         campaign = self.campaign_name.text().strip()
         actor = self.actor_name.text().strip().translate(ASCII_LOWER)
         for record in self.history.entries():
-            if record["campaign_name"] != campaign or record["actor_name"].translate(ASCII_LOWER) != actor:
+            if (record["campaign_name"] != campaign or record["actor_name"].translate(ASCII_LOWER) != actor
+                    or record.get("role", "pl") != self._selected_role()):
                 continue
             try:
                 _, address = server_urls(record["address"])
@@ -226,16 +344,17 @@ class PlayerWindow(QWidget):
         record = self._offline_record
         password = record["password"]
         if not password:
-            password, accepted = QInputDialog.getText(self, "重新连接", "角色密码", QLineEdit.EchoMode.Password)
+            password, accepted = QInputDialog.getText(self, "重新连接", "身份密码", QLineEdit.EchoMode.Normal)
             if not accepted or not 1 <= len(password) <= 256:
                 return
         self.password.setText(password)
         self._request("login", {"campaign_name": record["campaign_name"],
-                                "actor_name": record["actor_name"], "password": password})
+                                "actor_name": record["actor_name"], "password": password,
+                                "role": record.get("role", "pl")})
 
     def _save_login(self, password: str) -> None:
         if not self.history.save(self.session, self._websocket.toString(), password,
-                                 remember=self.remember_password.isChecked()):
+                                 remember=True):
             self.feedback.setText("角色记忆保存失败，请检查应用数据目录的写入权限。")
 
     def _login(self) -> None:
@@ -251,7 +370,8 @@ class PlayerWindow(QWidget):
         if not campaign_name or not 1 <= len(actor_name) <= 80:
             self.feedback.setText("角色信息错误")
             return
-        self._request("login", {"campaign_name": campaign_name, "actor_name": actor_name, "password": password})
+        self._request("login", {"campaign_name": campaign_name, "actor_name": actor_name,
+                                "password": password, "role": self._selected_role()})
 
     def _request(self, operation: str, body: dict | None = None) -> None:
         self._busy = True
@@ -280,6 +400,9 @@ class PlayerWindow(QWidget):
         if operation == "login":
             try:
                 session = ClientSession.from_response(response)
+                expected_role = (self._offline_record or {}).get("role", self._selected_role())
+                if session.role != expected_role:
+                    raise ValueError(LOGIN_ERRORS["role_mismatch"])
             except ValueError as error:
                 self.feedback.setText(str(error))
                 self._update_controls()
@@ -307,6 +430,13 @@ class PlayerWindow(QWidget):
             else:
                 self.feedback.setText("主机返回了无法识别的改密结果。")
             self._pending_password = ""
+        elif operation == "nickname":
+            self.session = replace(self.session, actor_name=response["actor_name"])
+            self.lobby.session = self.session
+            self.lobby.nickname.setText(self.session.actor_name)
+            self.history.rename(self.session)
+            self._show_lobby_identity(self.session.campaign_name, self.session.actor_name)
+            self.feedback.setText("昵称已更新，下次登录请使用新昵称。")
         elif operation == "logout":
             self._reset_login("已退出登录。")
         self._update_controls()
@@ -360,6 +490,9 @@ class PlayerWindow(QWidget):
         return HistoryCache(Path(self.history.settings.fileName()).with_name("history.sqlite3"), *identity)
 
     def _enter_lobby(self) -> None:
+        self._login_geometry = self.geometry()
+        self._login_minimum_size = self.minimumSize()
+        self._login_was_maximized = self.isMaximized()
         profile = self._offline_record
         campaign_name = self.session.campaign_name if self.session is not None else profile["campaign_name"]
         actor_name = self.session.actor_name if self.session is not None else profile["actor_name"]
@@ -375,11 +508,33 @@ class PlayerWindow(QWidget):
         self.pages.addWidget(self.lobby)
         self.pages.setCurrentWidget(self.lobby)
         self._show_lobby_identity(campaign_name, actor_name)
+        self._update_controls()
+        self._adapt_lobby_size()
         if self.session is not None:
             self.lobby._open_connection()
 
+    def _adapt_lobby_size(self) -> None:
+        self.layout().activate()
+        minimum = self.minimumSizeHint().expandedTo(QSize(880, 620))
+        target = self.size().expandedTo(QSize(960, 720))
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            decorations = self.frameGeometry().size() - self.size()
+            limit = available.size() - decorations
+            minimum = minimum.boundedTo(limit)
+            target = target.boundedTo(limit)
+        self.setMinimumSize(minimum)
+        if not self.isMaximized():
+            self.resize(target.expandedTo(minimum))
+            if screen is not None:
+                frame = self.frameGeometry()
+                self.move(max(available.left(), min(frame.left(), available.right() - frame.width() + 1)),
+                          max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1)))
+
     def _show_lobby_identity(self, campaign_name: str, actor_name: str) -> None:
-        self.identity.setText(f"[{campaign_name}]-{actor_name}")
+        role = self.session.role if self.session else (self._offline_record or {}).get("role", "pl")
+        self.identity.setText(f"[{campaign_name}]-{actor_name}" + (" · OB 观众" if role == "ob" else ""))
         self.setWindowTitle(f"Story · {actor_name}")
 
     def _leave_lobby(self) -> None:
@@ -391,6 +546,16 @@ class PlayerWindow(QWidget):
             self.pages.removeWidget(self.lobby)
             self.lobby.deleteLater()
             self.lobby = None
+            self.header.hide()
+            self.setMinimumSize(self._login_minimum_size)
+            if self._login_geometry is not None:
+                self.layout().activate()
+                if self._login_was_maximized:
+                    self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+                else:
+                    self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMaximized)
+                    self.setGeometry(self._login_geometry)
+                self._login_geometry = None
 
     def _reset_login(self, message: str) -> None:
         self.auth.cancel()
@@ -401,8 +566,8 @@ class PlayerWindow(QWidget):
         self._pending_password = ""
         self._load_history()
         self.pages.setCurrentIndex(0)
-        self.identity.setText("以角色身份加入跑团")
-        self.setWindowTitle("Story · 玩家登录")
+        self.identity.clear()
+        self.setWindowTitle("参与者登录")
         self.feedback.setText(message)
         self._update_controls()
 
@@ -424,7 +589,7 @@ class PlayerWindow(QWidget):
     def _update_controls(self) -> None:
         for field in (
             self.saved_logins, self.address, self.campaign_name, self.actor_name,
-            self.password, self.remember_password,
+            self.password, self.pl_role, self.ob_role, self.new_identity_button, self.manage_button,
         ):
             field.setEnabled(not self._busy)
         for button in (self.login_button, self.change_button, self.logout_button):
@@ -432,8 +597,20 @@ class PlayerWindow(QWidget):
         online = self.lobby is not None and self.lobby.socket.state() == QAbstractSocket.SocketState.ConnectedState
         self.change_button.setEnabled(online and not self._busy)
         self.change_button.setVisible(online)
+        is_ob = self.session is not None and self.session.role == "ob"
+        self.nickname_button.setVisible(is_ob)
+        self.nickname_button.setEnabled(online and is_ob and not self._busy)
         self.logout_button.setText("返回登录" if self._offline_record is not None else "退出登录")
         self.logout_button.setVisible(self.lobby is not None or self.session is not None)
+        self.header.setVisible(self.lobby is not None)
+
+    def _change_nickname(self) -> None:
+        if not self.nickname_button.isEnabled() or self.session is None:
+            return
+        session = self.session
+        nickname, accepted = QInputDialog.getText(self, "修改 OB 昵称", "昵称", text=session.actor_name)
+        if accepted and self.session is session and not self._busy:
+            self._request("nickname", {"nickname": nickname})
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.auth.cancel()

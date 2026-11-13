@@ -258,6 +258,26 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(event["text"], "中文 🎲\n第二行")
             self.assertTrue(event["own"])
 
+    async def test_login_role_mismatch_cannot_replace_existing_session(self) -> None:
+        ready = await self.login()
+        body = {"campaign_name": "联网测试", "actor_name": "调查员", "password": DEFAULT_PASSWORD, "role": "ob"}
+        status, response = await self.request("POST", "/auth/login", body)
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"], "role_mismatch")
+        self.assertEqual(self.application.state.auth.require_session(ready["token"]).role, "pl")
+        add_member(self.directory, "观众", role="ob")
+        body["actor_name"] = "观众"
+        status, response = await self.request("POST", "/auth/login", body)
+        self.assertEqual(status, 200, response)
+        self.assertEqual(response["role"], "ob")
+        body["role"] = "pl"
+        status, response = await self.request("POST", "/auth/login", body)
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"], "role_mismatch")
+        body["role"] = "kp"
+        status, _ = await self.request("POST", "/auth/login", body)
+        self.assertEqual(status, 422)
+
     async def test_message_retry_conflict_and_order(self) -> None:
         ready = await self.login()
         async with connect(self.ws, additional_headers={"Authorization": f"Bearer {ready['token']}"},

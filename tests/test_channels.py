@@ -6,13 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 
 from client.history_cache import HistoryCache
 from host import migrations
 from host.auth import AuthService, DEFAULT_PASSWORD
 from host.channels import (
-    BroadReadPolicy, archive_scene, create_scene, get_channel_access,
-    player_channel_state, set_visibility_mode,
+    BroadReadPolicy, archive_scene, create_scene, get_channel_access, local_channel_state,
+    mark_channel_read, move_members, player_channel_state, set_visibility_mode,
 )
 from host.management import add_member
 from host.messages import ChatSendError, lobby_history, save_lobby_message
@@ -99,6 +100,114 @@ class ChannelTests(unittest.TestCase):
             self.assertEqual(campaign_info(connection), {**before, "schema_version": migrations.SCHEMA_VERSION})
             self.assertEqual(connection.execute("SELECT message_id FROM messages").fetchone()[0], "old-message")
             self.assertEqual(connection.execute("SELECT visibility_mode FROM campaigns").fetchone()[0], "secret")
+
+    def test_moves_enforce_join_leave_and_rejoin_history_intervals(self) -> None:
+        basement = create_scene(self.directory, "地下室", [self.a, self.b])
+        lounge = create_scene(self.directory, "客厅", [])
+        save_lobby_message(self.directory, "basement-1", "共同线索", token=None, channel_id=basement)
+        save_lobby_message(self.directory, "lounge-1", "加入前的秘密", token=None, channel_id=lounge)
+        move_members(self.directory, [self.b], lounge)
+        save_lobby_message(self.directory, "basement-2", "离开期间的秘密", token=self.token_a, channel_id=basement)
+        save_lobby_message(self.directory, "lounge-2", "加入后的线索", token=self.token_b, channel_id=lounge)
+        self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_b, "latest", 0, lounge)["messages"]], [2])
+        with self.assertRaises(ChatSendError):
+            save_lobby_message(self.directory, "old-channel", "越权", token=self.token_b, channel_id=basement)
+        move_members(self.directory, [self.b], basement)
+        save_lobby_message(self.directory, "basement-3", "重聚后的线索", token=self.token_b, channel_id=basement)
+        self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_b, "latest", 0, basement)["messages"]], [1, 3])
+        self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_b, "after", 1, basement)["messages"]], [3])
+        self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_b, "before", 3, basement)["messages"]], [1])
+        set_visibility_mode(self.directory, "broad")
+        self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_b, "latest", 0, basement)["messages"]], [1, 2, 3])
+        self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_b, "latest", 0, lounge)["messages"]], [1, 2])
+        with self.assertRaises(ChatSendError):
+            save_lobby_message(self.directory, "broad-forgery", "旁观发言", token=self.token_b, channel_id=lounge)
+        with open_campaign(self.directory) as connection:
+            lobby = campaign_info(connection)["lobby_id"]
+        move_members(self.directory, [self.b], lobby)
+        self.assertEqual(player_channel_state(self.directory, self.token_b)["current_channel_id"], lobby)
+        save_lobby_message(self.directory, "back-lobby", "回大厅", token=self.token_b, channel_id=lobby)
+
+    def test_move_retries_stale_edits_and_invalid_batch_preserve_assignments(self) -> None:
+        basement = create_scene(self.directory, "地下室", [self.a, self.b])
+        lounge = create_scene(self.directory, "客厅", [])
+        revision = local_channel_state(self.directory)["revision"]
+        with self.assertRaises(ValueError):
+            move_members(self.directory, [self.a, "missing"], lounge)
+        self.assertEqual(player_channel_state(self.directory, self.token_a)["current_channel_id"], basement)
+        move_members(self.directory, [self.a], lounge, request_id="first-move", expected_revision=revision)
+        move_members(self.directory, [self.a], lounge, request_id="first-move", expected_revision=revision)
+        with self.assertRaises(ValueError):
+            move_members(self.directory, [self.b], lounge, expected_revision=revision)
+        move_members(self.directory, [self.a], basement)
+        move_members(self.directory, [self.a], lounge, request_id="first-move")
+        self.assertEqual(player_channel_state(self.directory, self.token_a)["current_channel_id"], basement)
+        with self.assertRaises(ValueError):
+            move_members(self.directory, [self.b], lounge, request_id="first-move")
+        before = local_channel_state(self.directory)["revision"]
+        move_members(self.directory, [self.a, self.b], basement)
+        self.assertEqual(local_channel_state(self.directory)["revision"], before)
+        archive_scene(self.directory, lounge)
+        with self.assertRaises(ValueError):
+            move_members(self.directory, [self.a], lounge)
+
+    def test_concurrent_move_and_send_have_a_consistent_permission_boundary(self) -> None:
+        basement = create_scene(self.directory, "地下室", [self.a])
+        lounge = create_scene(self.directory, "客厅", [])
+
+        def send():
+            try:
+                return save_lobby_message(self.directory, "racing-message", "并发消息", token=self.token_a, channel_id=basement)[0]
+            except ChatSendError as error:
+                self.assertEqual(error.code, "channel_forbidden")
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            send_result = executor.submit(send)
+            moved = executor.submit(move_members, self.directory, [self.a], lounge)
+            message = send_result.result()
+            moved.result()
+        self.assertEqual(player_channel_state(self.directory, self.token_a)["current_channel_id"], lounge)
+        with open_campaign(self.directory) as connection:
+            access = get_channel_access(connection, self.a, basement)
+            if message is not None:
+                self.assertTrue(access.includes(message["sequence"]))
+            self.assertFalse(access.can_send)
+            self.assertEqual(connection.execute("SELECT count(*) FROM channel_memberships WHERE member_id = ? AND end_sequence IS NULL", (self.a,)).fetchone()[0], 1)
+
+    def test_kp_unread_positions_persist_are_monotonic_and_exclude_own_messages(self) -> None:
+        scene = create_scene(self.directory, "地下室", [self.a])
+        for number in range(1, 4):
+            save_lobby_message(self.directory, f"unread-{number}", str(number), token=self.token_a, channel_id=scene)
+        save_lobby_message(self.directory, "kp-own", "主持回复", token=None, channel_id=scene)
+
+        def status():
+            return next(item for item in local_channel_state(self.directory)["channels"] if item["channel_id"] == scene)
+
+        self.assertEqual(status()["unread_count"], 3)
+        mark_channel_read(self.directory, scene, 2)
+        mark_channel_read(self.directory, scene, 1)
+        self.assertEqual(status()["read_sequence"], 2)
+        self.assertEqual(status()["unread_count"], 1)
+        mark_channel_read(self.directory, scene, 999)
+        self.assertEqual(status()["read_sequence"], 4)
+        save_lobby_message(self.directory, "after-read", "新线索", token=self.token_a, channel_id=scene)
+        self.assertEqual(status()["unread_count"], 1)
+        player_state = player_channel_state(self.directory, self.token_b)
+        self.assertNotIn("members", player_state)
+        self.assertTrue(all("unread_count" not in item for item in player_state["channels"]))
+
+    def test_v5_upgrade_keeps_participation_and_message_ids(self) -> None:
+        with patch.object(migrations, "SCHEMA_VERSION", 5):
+            directory = initialize_campaign(Path(self.temporary.name), "v5 团")
+            member = add_member(directory, "旧角色")
+            scene = create_scene(directory, "旧场景", [member])
+            message, _ = save_lobby_message(directory, "v5-message", "旧线索", token=None, channel_id=scene)
+        state = local_channel_state(directory)
+        self.assertEqual(state["members"][0]["channel_id"], scene)
+        with open_campaign(directory) as connection:
+            self.assertEqual(connection.execute("SELECT message_id FROM messages").fetchone()[0], message["message_id"])
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], migrations.SCHEMA_VERSION)
 
 
 class ChannelCacheTests(unittest.TestCase):

@@ -11,15 +11,15 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtNetwork import QAbstractSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLineEdit
 
 from client.auth_client import ClientSession, server_urls
 from client.history_cache import HistoryCache
-from client.player_window import PasswordDialog, PlayerWindow
+from client.player_window import IdentityManagementDialog, PasswordDialog, PlayerWindow
 from host.auth import AuthError, AuthService, DEFAULT_PASSWORD
-from host.channels import archive_scene
+from host.channels import archive_scene, create_scene
 from host.management import add_member
 from host.messages import save_lobby_message
 from host.server_controller import ServerController
@@ -163,6 +163,78 @@ class ClientGuiTests(unittest.TestCase):
         self.assertEqual(history.count("调查员甲：中文 🎲\n第二行  "), 1)
         self.assertIn("调查员甲：伪造发言人", history)
 
+    def test_lobby_resizes_and_restores_login_window_online_and_offline(self) -> None:
+        self.player.show()
+        self.player.resize(760, 386)
+        self.app.processEvents()
+        login_geometry = self.player.geometry()
+        login_minimum = self.player.minimumSize()
+        self.ready_player()
+        self.assertGreater(self.player.height(), login_geometry.height())
+        self.assertGreater(self.player.minimumHeight(), login_minimum.height())
+        self.assertGreater(self.player.lobby.chat_history.height(), 200)
+        self.player.logout_button.click()
+        self.wait_until(lambda: not self.player._busy)
+        self.assertEqual(self.player.geometry(), login_geometry)
+        self.assertEqual(self.player.minimumSize(), login_minimum)
+        self.assertTrue(self.player.header.isHidden())
+
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        self.login(self.player, DEFAULT_PASSWORD)
+        self.assertIsNotNone(self.player.lobby)
+        self.assertIsNone(self.player.session)
+        self.assertGreater(self.player.height(), login_geometry.height())
+        self.assertGreater(self.player.lobby.chat_history.height(), 200)
+        self.player.logout_button.click()
+        self.assertEqual(self.player.geometry(), login_geometry)
+        self.assertEqual(self.player.minimumSize(), login_minimum)
+
+    def test_observer_sees_old_and_new_scenes_but_can_only_chat_in_lobby(self) -> None:
+        scene = create_scene(self.directory, "活动现场", [])
+        archive = create_scene(self.directory, "已结束现场", [])
+        for channel in (scene, archive):
+            save_lobby_message(self.directory, f"history-{channel}", "OB 加入前的完整记录", token=None, channel_id=channel)
+        archive_scene(self.directory, archive)
+        add_member(self.directory, "旁观者", role="ob", password="观众密码")
+        self.player.actor_name.setText("旁观者")
+        self.player.ob_role.setChecked(True)
+        self.login(self.player, "观众密码")
+        self.wait_until(lambda: self.player.lobby is not None and self.player.lobby._channel_state_ready)
+        ob = self.player.lobby
+        self.assertEqual(self.player.session.role, "ob")
+        self.assertTrue(self.player.nickname_button.isVisibleTo(self.player))
+        for channel in (scene, archive):
+            ob.channel_choice.setCurrentIndex(ob.channel_choice.findData(channel))
+            self.wait_until(lambda: "OB 加入前的完整记录" in ob.chat_history.toPlainText())
+            self.assertTrue(ob.message.isReadOnly())
+            self.assertFalse(ob.send_button.isEnabled())
+        self.server.command("scene.create", name="后来创建的现场", member_ids=[], channel_id="future-scene")
+        self.wait_until(lambda: "future-scene" in ob._channels)
+        replies = []
+        ob.socket.textMessageReceived.connect(lambda payload: replies.append(json.loads(payload)))
+        ob.socket.sendTextMessage(json.dumps({"type": "chat.send", "channel_id": scene, "text": "越权发言", "request_id": "ob-forged"}))
+        self.wait_until(lambda: any(item.get("request_id") == "ob-forged" for item in replies))
+        self.assertEqual(next(item for item in replies if item.get("request_id") == "ob-forged")["code"], "channel_forbidden")
+        ob.channel_choice.setCurrentIndex(ob.channel_choice.findData(ob._assigned_channel_id))
+        self.wait_until(lambda: ob.send_button.isEnabled())
+        ob.message.setPlainText("OB 场外聊天")
+        ob.send_button.click()
+        self.wait_until(lambda: "旁观者：OB 场外聊天" in ob.chat_history.toPlainText())
+        self.player._request("nickname", {"nickname": "新昵称"})
+        self.wait_until(lambda: not self.player._busy)
+        self.assertEqual(self.player.session.actor_name, "新昵称")
+        self.assertEqual(self.player.history.entries()[0]["actor_name"], "新昵称")
+        ob.message.setPlainText("改名后仍在线")
+        ob.send_button.click()
+        self.wait_until(lambda: "新昵称：改名后仍在线" in ob.chat_history.toPlainText())
+        self.player._pending_password = "新观众密码"
+        self.player._request("password", {"current_password": "观众密码", "new_password": "新观众密码"})
+        self.wait_until(lambda: not self.player._busy)
+        self.assertEqual(self.player.feedback.text(), "密码已更新。")
+        self.assertEqual(self.service.require_session(self.player.session.token).role, "ob")
+        self.assertEqual(self.player.history.entries()[0]["password"], "新观众密码")
+
     def test_wrong_password_stays_on_login(self) -> None:
         for password in ("", "wrong"):
             self.login(self.player, password)
@@ -170,6 +242,71 @@ class ClientGuiTests(unittest.TestCase):
             self.assertEqual(self.player.pages.currentIndex(), 0)
             self.assertEqual(self.player.feedback.text(), "密码错误")
             self.assertTrue(self.player.login_button.isEnabled())
+
+    def test_identity_cards_new_form_and_management_only_remove_local_memory(self) -> None:
+        self.ready_player()
+        original_token = self.player.session.token
+        self.server.command("say", text="删除登录记忆也保留历史")
+        self.wait_until(lambda: "删除登录记忆也保留历史" in self.player.lobby.chat_history.toPlainText())
+        cache = self.player.lobby._cache
+        add_member(self.directory, "观众甲", role="ob", password="ob-password")
+        second = self.new_player()
+        second.actor_name.setText("观众甲")
+        second.ob_role.setChecked(True)
+        self.login(second, "ob-password")
+        self.wait_until(lambda: second.lobby is not None and second.lobby._channel_state_ready)
+        ob_token = second.session.token
+        self.player._reset_login("")
+        self.assertEqual(self.player.windowTitle(), "参与者登录")
+        self.assertTrue(self.player.header.isHidden())
+        self.assertEqual(self.player.saved_logins.currentItem().toolTip(), "[玩家联调团]-OB-观众甲")
+        self.assertTrue(self.player.ob_role.isChecked())
+        self.assertEqual(self.player.password.echoMode(), QLineEdit.EchoMode.Normal)
+        self.assertEqual(self.player.password.text(), "ob-password")
+        self.player.saved_logins.setCurrentRow(1)
+        self.assertTrue(self.player.pl_role.isChecked())
+        self.assertEqual(self.player.actor_name.text(), "调查员甲")
+        self.player.new_identity_button.click()
+        for field in (self.player.campaign_name, self.player.actor_name, self.player.password, self.player.address):
+            self.assertEqual(field.text(), "")
+        self.assertEqual(self.player.saved_logins.count(), 2)
+        self.player.saved_logins.setCurrentRow(0)
+
+        def delete_ob_record():
+            dialog = self.player.findChild(IdentityManagementDialog)
+            dialog.identities.setCurrentRow(0)
+            dialog.delete_button.click()
+            dialog.accept()
+
+        QTimer.singleShot(0, delete_ob_record)
+        self.player.manage_button.click()
+        self.assertEqual(self.player.saved_logins.count(), 1)
+        self.assertIsNone(self.player.saved_logins.currentItem())
+        self.assertEqual(self.player.actor_name.text(), "")
+        self.assertEqual(self.service.require_session(ob_token).role, "ob")
+        self.assertEqual(self.service.require_session(original_token).role, "pl")
+        self.assertTrue(any(message["text"] == "删除登录记忆也保留历史" for message in cache.page()))
+        self.player.saved_logins.setCurrentRow(0)
+        self.assertEqual(self.player.password.text(), DEFAULT_PASSWORD)
+
+    def test_selected_role_is_checked_online_and_for_offline_history(self) -> None:
+        self.player.ob_role.setChecked(True)
+        self.login(self.player, DEFAULT_PASSWORD)
+        self.assertIsNone(self.player.session)
+        self.assertIn("身份不匹配", self.player.feedback.text())
+        self.player.pl_role.setChecked(True)
+        self.ready_player()
+        self.player.close()
+        self.server.stop()
+        self.wait_until(lambda: not self.server.active)
+        reopened = self.new_player()
+        reopened.ob_role.setChecked(True)
+        self.login(reopened, DEFAULT_PASSWORD)
+        self.assertIsNone(reopened.lobby)
+        reopened.pl_role.setChecked(True)
+        self.login(reopened, DEFAULT_PASSWORD)
+        self.assertIsNotNone(reopened.lobby)
+        self.assertIsNone(reopened.session)
 
     def test_campaign_name_is_required_and_checked_by_host(self) -> None:
         for name in ("", "别的团"):
@@ -211,17 +348,18 @@ class ClientGuiTests(unittest.TestCase):
         reopened = PlayerWindow(QSettings(self.settings_path, QSettings.Format.IniFormat))
         self.players.append(reopened)
         self.assertIsNone(reopened.session)
-        self.assertEqual(reopened.saved_logins.currentText(), "[玩家联调团]-调查员乙")
-        reopened.saved_logins.setCurrentIndex(1)
+        self.assertEqual(reopened.saved_logins.currentItem().toolTip(), "[玩家联调团]-PL-调查员乙")
+        reopened.saved_logins.setCurrentRow(1)
         self.assertEqual(reopened.campaign_name.text(), "玩家联调团")
         self.assertEqual(reopened.actor_name.text(), "调查员甲")
         self.assertEqual(reopened.address.text(), self.address)
         self.assertEqual(reopened.password.text(), PASSWORD)
-        reopened.saved_logins.setCurrentIndex(2)
-        self.assertEqual(reopened.saved_logins.currentText(), "新登录")
+        reopened.new_identity_button.click()
+        self.assertIsNone(reopened.saved_logins.currentItem())
         self.assertEqual(reopened.campaign_name.text(), "")
         self.assertEqual(reopened.actor_name.text(), "")
-        self.assertTrue(reopened.remember_password.isChecked())
+        self.assertEqual(reopened.password.text(), "")
+        self.assertEqual(reopened.address.text(), "")
 
     def test_relogin_replaces_old_qt_client_and_restores_its_draft(self) -> None:
         self.ready_player()
@@ -245,7 +383,7 @@ class ClientGuiTests(unittest.TestCase):
         with patch("client.login_history.QStandardPaths.writableLocation", return_value=str(data_dir)):
             player = PlayerWindow()
             self.players.append(player)
-            self.assertEqual(player.saved_logins.currentText(), "新登录")
+            self.assertEqual(player.saved_logins.count(), 0)
             player.address.setText(self.address)
             player.campaign_name.setText("玩家联调团")
             player.actor_name.setText("调查员甲")
@@ -256,13 +394,13 @@ class ClientGuiTests(unittest.TestCase):
             self.wait_until(lambda: not player._busy)
             self.assertIsNone(player.session)
             self.assertIsNone(player.lobby)
-            self.assertEqual(player.saved_logins.currentText(), "[玩家联调团]-调查员甲")
+            self.assertEqual(player.saved_logins.currentItem().toolTip(), "[玩家联调团]-PL-调查员甲")
             player.close()
 
             reopened = PlayerWindow()
             self.players.append(reopened)
             self.assertIsNone(reopened.session)
-            self.assertEqual(reopened.saved_logins.currentText(), "[玩家联调团]-调查员甲")
+            self.assertEqual(reopened.saved_logins.currentItem().toolTip(), "[玩家联调团]-PL-调查员甲")
             self.assertEqual(reopened.campaign_name.text(), "玩家联调团")
             self.assertEqual(reopened.actor_name.text(), "调查员甲")
             self.assertEqual(reopened.address.text(), self.address)
@@ -291,8 +429,10 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: lobby.socket.state() == CONNECTED)
         self.server.command("say", text="重启后的新消息")
         self.wait_until(lambda: "重启后的新消息" in lobby.chat_history.toPlainText())
+        # 实时消息可能先于频道权限恢复；按钮可用后才模拟用户重发。
+        self.wait_until(lobby.send_button.isEnabled)
         lobby.send_button.click()
-        self.wait_until(lambda: not lobby._awaiting_send)
+        self.wait_until(lambda: not lobby._awaiting_send and lobby.message.toPlainText() == "")
         self.assertEqual(lobby.message.toPlainText(), "")
         self.assertEqual(lobby.chat_history.toPlainText().splitlines(), [
             f"调查员甲：{draft}", "KP：重启后的新消息",
@@ -407,9 +547,8 @@ class ClientGuiTests(unittest.TestCase):
                 save_lobby_message(self.directory, f"seed-{number}", f"历史 {number:03d}", token=None)
 
         populate(1, 55)
-        self.player.remember_password.setChecked(False)
         self.ready_player()
-        self.assertEqual(self.player.history.entries()[0]["password"], "")
+        self.assertEqual(self.player.history.entries()[0]["password"], DEFAULT_PASSWORD)
         lobby = self.player.lobby
         self.wait_until(lambda: "历史 055" in lobby.chat_history.toPlainText())
         self.assertEqual(len(lobby.chat_history.toPlainText().splitlines()), 50)
