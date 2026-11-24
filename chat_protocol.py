@@ -26,6 +26,7 @@ SEND_ERRORS = {
     "request_id_conflict": "此请求 ID 已用于另一条消息。",
     "storage_error": "主机保存消息失败，草稿已保留，可以重试。",
     "channel_forbidden": "你无权在这个频道发言。",
+    "attributes_required": "请先在「个人属性」中导入角色属性，再发言。",
     "channel_read_forbidden": "你无权查看这个频道。",
 }
 

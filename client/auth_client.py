@@ -75,7 +75,7 @@ class AuthClient(QObject):
         if token:
             request.setRawHeader(b"Authorization", f"Bearer {token}".encode("ascii"))
         self._operation = operation
-        if operation == "session":
+        if operation == "session" or (operation == "attributes" and body is None):
             self._reply = self.manager.get(request)
         else:
             payload = json.dumps(body or {}, ensure_ascii=False).encode("utf-8")

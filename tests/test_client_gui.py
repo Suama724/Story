@@ -24,6 +24,7 @@ from host.management import add_member
 from host.messages import save_lobby_message
 from host.server_controller import ServerController
 from host.storage import initialize_campaign
+from tests.attribute_fixtures import add_ready_player
 
 PASSWORD = "我的新密码🎲123456"
 CONNECTED = QAbstractSocket.SocketState.ConnectedState
@@ -89,7 +90,7 @@ class ClientGuiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.directory = initialize_campaign(Path(self.temporary.name), "玩家联调团")
-        add_member(self.directory, "调查员甲")
+        add_ready_player(self.directory, "调查员甲")
         self.settings_path = str(Path(self.temporary.name) / "player.ini")
         self.service = AuthService(self.directory)
         self.server = ServerController()
@@ -147,7 +148,7 @@ class ClientGuiTests(unittest.TestCase):
 
     def test_first_login_enters_lobby_and_binds_sender(self) -> None:
         self.ready_player()
-        self.assertIn("调查员甲", self.player.identity.text())
+        self.assertIn("调查员甲", self.player.windowTitle())
         self.assertTrue(self.player.lobby.nickname.isReadOnly())
         self.server.command("say", text="欢迎调查员 🎲")
         self.wait_until(lambda: "欢迎调查员 🎲" in self.player.lobby.chat_history.toPlainText())
@@ -173,11 +174,11 @@ class ClientGuiTests(unittest.TestCase):
         self.assertGreater(self.player.height(), login_geometry.height())
         self.assertGreater(self.player.minimumHeight(), login_minimum.height())
         self.assertGreater(self.player.lobby.chat_history.height(), 200)
-        self.player.logout_button.click()
+        self.player._session_rejected()
         self.wait_until(lambda: not self.player._busy)
         self.assertEqual(self.player.geometry(), login_geometry)
         self.assertEqual(self.player.minimumSize(), login_minimum)
-        self.assertTrue(self.player.header.isHidden())
+        self.assertFalse(hasattr(self.player, "header"))
 
         self.server.stop()
         self.wait_until(lambda: not self.server.active)
@@ -186,7 +187,7 @@ class ClientGuiTests(unittest.TestCase):
         self.assertIsNone(self.player.session)
         self.assertGreater(self.player.height(), login_geometry.height())
         self.assertGreater(self.player.lobby.chat_history.height(), 200)
-        self.player.logout_button.click()
+        self.player._session_rejected()
         self.assertEqual(self.player.geometry(), login_geometry)
         self.assertEqual(self.player.minimumSize(), login_minimum)
 
@@ -203,7 +204,8 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: self.player.lobby is not None and self.player.lobby._channel_state_ready)
         ob = self.player.lobby
         self.assertEqual(self.player.session.role, "ob")
-        self.assertTrue(self.player.nickname_button.isVisibleTo(self.player))
+        self.assertEqual(self.player.personal_info_dialog.identity.text(), "OB")
+        self.assertFalse(hasattr(self.player, "header"))
         for channel in (scene, archive):
             ob.channel_choice.setCurrentIndex(ob.channel_choice.findData(channel))
             self.wait_until(lambda: "OB 加入前的完整记录" in ob.chat_history.toPlainText())
@@ -258,7 +260,7 @@ class ClientGuiTests(unittest.TestCase):
         ob_token = second.session.token
         self.player._reset_login("")
         self.assertEqual(self.player.windowTitle(), "参与者登录")
-        self.assertTrue(self.player.header.isHidden())
+        self.assertFalse(hasattr(self.player, "header"))
         self.assertEqual(self.player.saved_logins.currentItem().toolTip(), "[玩家联调团]-OB-观众甲")
         self.assertTrue(self.player.ob_role.isChecked())
         self.assertEqual(self.player.password.echoMode(), QLineEdit.EchoMode.Normal)
@@ -341,7 +343,7 @@ class ClientGuiTests(unittest.TestCase):
         self.assertIs(self.player.lobby.socket, socket_before_change)
         self.assertEqual(socket_before_change.state(), CONNECTED)
 
-        add_member(self.directory, "调查员乙")
+        add_ready_player(self.directory, "调查员乙")
         second = self.new_player()
         second.actor_name.setText("调查员乙")
         self.login(second, DEFAULT_PASSWORD)
@@ -375,7 +377,7 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: second.session is None)
         self.assertEqual(self.player.lobby.message.toPlainText(), "被顶替时保留的草稿")
 
-    def test_logout_revokes_session_and_restores_saved_login(self) -> None:
+    def test_server_revocation_restores_saved_login(self) -> None:
         data_dir = Path(self.temporary.name) / "app-data"
         data_dir.mkdir()
         # 隔离旧注册表中的真实用户记录，走默认设置文件路径。
@@ -390,7 +392,8 @@ class ClientGuiTests(unittest.TestCase):
             self.login(player, DEFAULT_PASSWORD)
             self.wait_until(lambda: player.lobby is not None and player.lobby.socket.state() == CONNECTED)
             token = player.session.token
-            player.logout_button.click()
+            self.service.logout(player.session.token)
+            player._session_rejected()
             self.wait_until(lambda: not player._busy)
             self.assertIsNone(player.session)
             self.assertIsNone(player.lobby)
@@ -483,7 +486,7 @@ class ClientGuiTests(unittest.TestCase):
                 lobby.connect_button.click()
                 self.wait_until(lambda: "自动重连失败" in lobby.feedback.text())
                 self.assertEqual(lobby._retry_count, 2)
-                self.assertEqual(lobby.connection_status.text(), "未连接")
+                self.assertTrue(lobby.connection_status.text().endswith("-未连接"))
                 self.assertTrue(lobby.connect_button.isEnabled())
                 self.assertFalse(lobby._reconnect_timer.isActive())
 
@@ -552,7 +555,7 @@ class ClientGuiTests(unittest.TestCase):
         lobby = self.player.lobby
         self.wait_until(lambda: "历史 055" in lobby.chat_history.toPlainText())
         self.assertEqual(len(lobby.chat_history.toPlainText().splitlines()), 50)
-        lobby.older_button.click()
+        lobby.chat_history.request_older()
         self.wait_until(lambda: "历史 001" in lobby.chat_history.toPlainText())
 
         reopened = self.new_player()
@@ -575,11 +578,11 @@ class ClientGuiTests(unittest.TestCase):
         self.login(reopened, DEFAULT_PASSWORD)
         self.assertIsNone(reopened.session)
         lobby = reopened.lobby
-        self.assertEqual(lobby.connection_status.text(), "未连接")
+        self.assertTrue(lobby.connection_status.text().endswith("-未连接"))
         self.assertTrue(lobby.message.isReadOnly())
         self.assertFalse(lobby.send_button.isEnabled())
         self.assertIn("历史 055", lobby.chat_history.toPlainText())
-        lobby.older_button.click()
+        lobby.chat_history.request_older()
         self.assertIn("历史 001", lobby.chat_history.toPlainText())
 
         populate(56, 110)
@@ -606,7 +609,7 @@ class ClientGuiTests(unittest.TestCase):
         self.assertIsNone(reopened.lobby)
         self.assertEqual(reopened.feedback.text(), "密码错误")
 
-    def test_reconnect_restores_current_assignment_and_offline_archive_returns_to_lobby(self) -> None:
+    def test_reconnect_keeps_selected_channel_and_archiving_preserves_other_drafts(self) -> None:
         self.ready_player()
         lobby = self.player.lobby
         lobby_id = lobby._channel_id
@@ -620,7 +623,8 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: bool(states))
         lobby.connect_button.click()
         self.wait_until(lambda: lobby._channel_state_ready and lobby._assigned_channel_id == "offline-scene")
-        self.assertEqual(lobby._channel_id, "offline-scene")
+        self.assertEqual(lobby._channel_id, lobby_id)
+        lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData("offline-scene"))
         lobby.message.setPlainText("场景中的发言")
         lobby.send_button.click()
         self.wait_until(lambda: not lobby._awaiting_send)
@@ -633,7 +637,9 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: self.server.state == "running")
         lobby.connect_button.click()
         self.wait_until(lambda: lobby._channel_state_ready and lobby._assigned_channel_id == lobby_id)
-        self.assertEqual(lobby._channel_id, lobby_id)
+        self.assertEqual(lobby._channel_id, "offline-scene")
+        self.assertFalse(lobby.send_button.isEnabled())
+        lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData(lobby_id))
         self.assertEqual(lobby.message.toPlainText(), "大厅未发草稿")
         lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData("offline-scene"))
         self.wait_until(lambda: "场景中的发言" in lobby.chat_history.toPlainText())

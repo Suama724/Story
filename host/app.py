@@ -17,6 +17,8 @@ def create_app(
     on_message: Callable[[dict[str, object]], None] | None = None,
     on_password_changed: Callable[[], None] | None = None,
     on_player_log: Callable[[str], None] | None = None,
+    on_presence_changed: Callable[[list[str]], None] | None = None,
+    on_attributes_changed: Callable[[], None] | None = None,
 ) -> FastAPI:
     configured_directory = directory or os.environ.get("STORY_CAMPAIGN_DIR")
     auth = None
@@ -29,7 +31,9 @@ def create_app(
     application = FastAPI(title="Story Host")
     application.state.auth = auth
     application.state.on_password_changed = on_password_changed
-    application.state.lobby = Lobby(auth, on_message, on_player_log=on_player_log)
+    application.state.on_attributes_changed = on_attributes_changed
+    application.state.lobby = Lobby(auth, on_message, on_player_log=on_player_log,
+                                    on_presence_changed=on_presence_changed)
     application.include_router(auth_router)
     application.include_router(lobby_router)
     application.add_api_route("/health", health)

@@ -110,6 +110,13 @@ def initialize_campaign(
                        VALUES (?, ?, ?, 'lobby', 'active', ?)""",
                     (lobby_id, session_id, "大厅", created_at),
                 )
+                if connection.execute("PRAGMA user_version").fetchone()[0] >= 8:
+                    group_id = f"default-{session_id}"
+                    connection.execute(
+                        "INSERT INTO channel_groups(id, session_id, name) VALUES (?, ?, '频道')",
+                        (group_id, session_id),
+                    )
+                    connection.execute("UPDATE channels SET group_id = ? WHERE id = ?", (group_id, lobby_id))
                 create_member(connection, campaign_id, "KP", "KP", role="kp")
     except Exception:
         # 目录由本次 UUID 初始化独占创建，失败后清理空数据库。

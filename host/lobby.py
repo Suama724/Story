@@ -45,10 +45,12 @@ class Lobby:
         self, auth: AuthService | None,
         on_message: Callable[[dict[str, object]], None] | None = None,
         on_player_log: Callable[[str], None] | None = None,
+        on_presence_changed: Callable[[list[str]], None] | None = None,
     ) -> None:
         self.auth = auth
         self.on_message = on_message
         self.on_player_log = on_player_log
+        self.on_presence_changed = on_presence_changed
         self.connections: dict[WebSocket, AuthenticatedConnection | None] = {}
         self.channel_clients: set[WebSocket] = set()
         # 登录顶替、改密、订阅和广播共用此锁，避免撤销期间漏发消息。
@@ -59,6 +61,13 @@ class Lobby:
         client = self.connections.pop(websocket, None)
         if client is not None and self.on_player_log is not None:
             self.on_player_log(f"{client.session.actor_name}离开了")
+        if client is not None:
+            self._publish_presence()
+
+    def _publish_presence(self) -> None:
+        if self.on_presence_changed is not None:
+            self.on_presence_changed(sorted({client.session.member_id for client in self.connections.values()
+                                             if client is not None}))
 
     async def close_connection(self, websocket: WebSocket) -> None:
         self._remove_connection(websocket)
@@ -91,6 +100,8 @@ class Lobby:
             self.connections[websocket] = client
             if client is not None and self.on_player_log is not None:
                 self.on_player_log(f"{nickname}加入了")
+            if client is not None:
+                self._publish_presence()
 
         try:
             while True:
@@ -176,10 +187,11 @@ class Lobby:
         state = await run_in_threadpool(player_channel_state, self.auth.directory, client.token)
         await websocket.send_json({"type": CHANNEL_CHANGED, **state})
 
-    async def channels_changed(self) -> None:
+    async def channels_changed(self, *, member_id: str | None = None) -> None:
         """调用方持有大厅锁，先提交分组，再发布当前权限。"""
         for websocket, client in tuple(self.connections.items()):
-            if client is None or websocket not in self.channel_clients:
+            if (client is None or websocket not in self.channel_clients
+                    or (member_id is not None and client.session.member_id != member_id)):
                 continue
             try:
                 await self.send_channel_state(websocket, client)

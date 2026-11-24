@@ -3,7 +3,7 @@
 import sqlite3
 
 APPLICATION_ID = 0x53545259  # STRY
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 def _preserve_identity_triggers(connection: sqlite3.Connection) -> None:
@@ -201,6 +201,30 @@ MIGRATIONS = (
         """CREATE UNIQUE INDEX unique_character_name ON actors(name COLLATE NOCASE)
            WHERE kind IN ('kp', 'pc', 'ob')""",
         _finish_identity_rebuild,
+    ),
+    (
+        "DROP INDEX one_active_scene_per_member",
+        """CREATE UNIQUE INDEX one_active_membership_per_channel
+           ON channel_memberships(member_id, channel_id) WHERE end_sequence IS NULL""",
+        """CREATE TABLE channel_groups (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL REFERENCES play_sessions(id),
+            name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 80),
+            position INTEGER NOT NULL DEFAULT 0
+        )""",
+        "ALTER TABLE channels ADD COLUMN group_id TEXT REFERENCES channel_groups(id)",
+        "ALTER TABLE channels ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+        """INSERT INTO channel_groups(id, session_id, name)
+           SELECT 'default-' || id, id, '频道' FROM play_sessions""",
+        "UPDATE channels SET group_id = 'default-' || session_id",
+    ),
+    (
+        """CREATE TABLE actor_attributes (
+            actor_id TEXT PRIMARY KEY NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+            ruleset TEXT NOT NULL,
+            values_json TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        )""",
     ),
 )
 

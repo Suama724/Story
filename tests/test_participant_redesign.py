@@ -1,0 +1,311 @@
+"""参与者新版导航、独立状态探测、只读资料与滚动历史的验收。"""
+
+import os
+import socket
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtWidgets import QApplication, QPushButton
+
+from client.chat_history import ChatHistory
+from client.player_window import PasswordDialog, PlayerWindow
+from host.channels import create_channel_group, create_scene
+from host.management import add_member
+from host.messages import save_lobby_message
+from tests.attribute_fixtures import add_ready_player
+from host.server_controller import ServerController
+from host.storage import initialize_campaign
+
+
+class ScrollHistoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    @staticmethod
+    def records(start, stop):
+        return [{"sequence": n, "message_id": str(n), "nickname": "KP", "text": f"记录 {n:05d}"}
+                for n in range(start, stop)]
+
+    def test_prepend_preserves_reading_anchor_and_live_append_does_not_jump(self):
+        view = ChatHistory()
+        view.resize(600, 320)
+        view.show()
+        view.add_messages(self.records(5001, 5101))
+        self.app.processEvents()
+        bar = view.verticalScrollBar()
+        bar.setValue(0)
+        anchor = view.firstVisibleBlock().text()
+        for end in range(5001, 1, -100):
+            view.add_messages(self.records(max(1, end - 100), end))
+        self.app.processEvents()
+        self.assertEqual(view.firstVisibleBlock().text(), anchor)
+        self.assertEqual(view.oldest_sequence, 1)
+        self.assertEqual(view.document().blockCount(), 5100)
+        bar.setValue(20)
+        anchor, value = view.firstVisibleBlock().text(), bar.value()
+        view.add_messages(self.records(5101, 5102))
+        self.assertEqual(bar.value(), value)
+        self.assertEqual(view.firstVisibleBlock().text(), anchor)
+        bar.setValue(bar.maximum())
+        view.add_messages(self.records(5102, 5103))
+        self.assertEqual(bar.value(), bar.maximum())
+        view.add_messages(self.records(1, 5103))
+        self.assertEqual(view.document().blockCount(), 5102)
+        view.close()
+
+    def test_scroll_requests_one_page_at_a_time_and_stops_at_history_end(self):
+        view = ChatHistory()
+        view.resize(500, 300)
+        view.show()
+        view.add_messages(self.records(51, 101))
+        self.app.processEvents()
+        requests = []
+        view.olderRequested.connect(lambda: requests.append(view.oldest_sequence))
+        view.set_pagination(True)
+        view.verticalScrollBar().setValue(0)
+        view.request_older()
+        self.assertEqual(requests, [51])
+        view.add_messages(self.records(1, 51))
+        view.set_pagination(False)
+        view.verticalScrollBar().setValue(0)
+        view.request_older()
+        self.assertEqual(requests, [51])
+        view.close()
+
+
+class ParticipantUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.directory = initialize_campaign(self.root, "参与者界面团")
+        self.member = add_ready_player(self.directory, "林舟")
+        add_member(self.directory, "旁观者", role="ob")
+        add_member(self.directory, "其他PL")
+        group = create_channel_group(self.directory, "调查现场")
+        self.first = create_scene(self.directory, "旧码头", [self.member], group_id=group, description="夜间调查")
+        self.second = create_scene(self.directory, "钟楼", [self.member], group_id=group)
+        for n in range(1, 126):
+            save_lobby_message(self.directory, f"record-{n}", f"记录 {n:03d}", token=None, channel_id=self.first)
+        self.server = ServerController()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            self.port = listener.getsockname()[1]
+        self.players = []
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait(lambda: self.server.state == "running")
+        self.player = self.login()
+        self.lobby = self.player.lobby
+
+    def tearDown(self):
+        for player in self.players:
+            player.close()
+        self.server.stop()
+        self.wait(lambda: not self.server.active)
+        for player in self.players:
+            player.deleteLater()
+        self.server.deleteLater()
+        self.app.processEvents()
+        self.temp.cleanup()
+
+    def wait(self, check, timeout=12):
+        deadline = time.monotonic() + timeout
+        while True:
+            self.app.processEvents()
+            if check():
+                return
+            if time.monotonic() >= deadline:
+                self.fail("等待界面或网络状态超时")
+            time.sleep(.01)
+
+    def login(self):
+        player = PlayerWindow(QSettings(str(self.root / "player.ini"), QSettings.Format.IniFormat))
+        self.players.append(player)
+        player.address.setText(f"ws://127.0.0.1:{self.port}/ws/lobby")
+        player.campaign_name.setText("参与者界面团")
+        player.actor_name.setText("林舟")
+        player.password.setText("123456")
+        player.login_button.click()
+        self.wait(lambda: player.lobby is not None and not player._busy)
+        if player.session is not None:
+            self.wait(lambda: player.lobby.is_online and player.lobby._history_request is None)
+        return player
+
+    def select(self, channel):
+        self.lobby.channel_choice.setCurrentIndex(self.lobby.channel_choice.findData(channel))
+        self.wait(lambda: self.lobby._history_request is None)
+
+    def test_layout_and_monitor_distinguish_manual_disconnect_from_host_shutdown(self):
+        self.player.show()
+        self.app.processEvents()
+        self.assertFalse(hasattr(self.player, "header"))
+        self.assertEqual(self.lobby.campaign_title.text(), "参与者界面团")
+        self.assertEqual(self.lobby.channel_choice.findChildren(QPushButton), [])
+        buttons = {button.text() for button in self.lobby.findChildren(QPushButton)}
+        self.assertEqual(buttons, {"频道简介", "频道成员", "log", "个人属性", "断开连接", "发送"})
+        self.assertEqual(self.lobby.connection_status.text(), "已开启-已连接")
+        self.lobby.connection_button.click()
+        self.wait(lambda: not self.lobby.is_online)
+        self.lobby._host_monitor.check()
+        self.wait(lambda: self.lobby.connection_status.text() == "已开启-未连接")
+        self.assertFalse(self.lobby._reconnect_timer.isActive())
+        self.server.stop()
+        self.wait(lambda: not self.server.active)
+        self.lobby._host_monitor.check()
+        self.wait(lambda: self.lobby.connection_status.text() == "未开启-未连接")
+        self.server.start(self.directory, "127.0.0.1", self.port)
+        self.wait(lambda: self.server.state == "running")
+        self.lobby._host_monitor.check()
+        self.wait(lambda: self.lobby.connection_status.text() == "已开启-未连接")
+        self.lobby.connection_button.click()
+        self.wait(lambda: self.lobby.is_online)
+        self.assertEqual(self.lobby.connection_status.text(), "已开启-已连接")
+
+    def test_main_scroll_and_log_have_independent_paging_and_cached_member_data(self):
+        self.select(self.first)
+        self.lobby.chat_history.request_older()
+        self.wait(lambda: self.lobby._history_request is None)
+        self.assertIn("记录 026", self.lobby.chat_history.toPlainText())
+        self.lobby.chat_history.request_older()
+        self.wait(lambda: self.lobby._history_request is None)
+        self.assertIn("记录 001", self.lobby.chat_history.toPlainText())
+        self.assertFalse(self.lobby.chat_history.has_more)
+        self.lobby.channel_info_button.click()
+        self.assertEqual(self.lobby._info_dialogs[self.first].content.toPlainText(), "夜间调查")
+        self.lobby.channel_members_button.click()
+        members = self.lobby._members_dialogs[self.first]
+        self.wait(lambda: members.table.rowCount() == 3)
+        names = {members.table.item(row, 1).text() for row in range(members.table.rowCount())}
+        self.assertEqual(names, {"KP", "林舟", "旁观者"})
+        self.assertTrue(all(set(m) == {"role", "actor_name"} for m in self.lobby._channels[self.first]["members"]))
+        self.lobby.channel_log_button.click()
+        log = self.lobby._log_dialogs[self.first]
+        self.wait(lambda: log.loaded)
+        self.select(self.second)
+        while log.has_more:
+            log.history.request_older()
+            self.wait(lambda: not log.loading)
+        self.assertEqual(log.channel_id, self.first)
+        self.assertIn("记录 001", log.history.toPlainText())
+        self.assertIn("记录 125", log.history.toPlainText())
+        self.assertEqual(self.lobby._channel_id, self.second)
+        self.lobby.connection_button.click()
+        self.wait(lambda: not self.lobby.is_online)
+        self.select(self.first)
+        self.lobby._open_channel_log()
+        self.assertIn("本地聊天记录", log.windowTitle())
+        while log.has_more:
+            log.history.request_older()
+        self.assertIn("记录 001", log.history.toPlainText())
+
+    def test_offline_login_reuses_group_navigation_and_local_log(self):
+        self.select(self.first)
+        while self.lobby.chat_history.has_more:
+            self.lobby.chat_history.request_older()
+            self.wait(lambda: self.lobby._history_request is None)
+        self.player.close()
+        self.server.stop()
+        self.wait(lambda: not self.server.active)
+        reopened = self.login()
+        self.assertIsNone(reopened.session)
+        self.lobby = reopened.lobby
+        self.wait(lambda: self.lobby.connection_status.text() == "未开启-未连接")
+        self.select(self.first)
+        self.lobby._open_channel_log()
+        log = self.lobby._log_dialogs[self.first]
+        while log.has_more:
+            log.history.request_older()
+        self.assertIn("记录 001", log.history.toPlainText())
+        self.assertEqual(self.lobby.channel_choice.topLevelItemCount(), 2)
+        self.assertFalse(self.lobby.send_button.isEnabled())
+
+    def test_open_log_is_reloaded_when_history_permissions_narrow(self):
+        lobby_id = next(key for key, channel in self.lobby._channels.items() if channel["kind"] == "lobby")
+        self.server.command("members.move", member_ids=[self.member], channel_id=lobby_id)
+        self.wait(lambda: self.lobby._assigned_channel_id == lobby_id)
+        self.server.command("visibility.set", mode="broad")
+        self.wait(lambda: self.lobby._channels[self.first]["history_ranges"] == [[1, None]])
+        self.select(self.first)
+        self.server.command("say", channel_id=self.first, text="参与区间外的新记录")
+        self.wait(lambda: "参与区间外的新记录" in self.lobby.chat_history.toPlainText())
+        self.lobby._open_channel_log()
+        log = self.lobby._log_dialogs[self.first]
+        self.wait(lambda: log.loaded)
+        self.assertIn("参与区间外的新记录", log.history.toPlainText())
+        self.server.command("visibility.set", mode="secret")
+        self.wait(lambda: self.lobby._channels[self.first]["history_ranges"] == [[1, 125]]
+                  and log.loaded and not log.loading)
+        self.assertNotIn("参与区间外的新记录", log.history.toPlainText())
+        self.assertLessEqual(log.history.newest_sequence, 125)
+
+    def test_personal_info_password_change_updates_display_and_offline_login(self):
+        self.lobby.personal_info_button.click()
+        dialog = self.player.personal_info_dialog
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual((dialog.identity.text(), dialog.name.text(), dialog.password.text()), ("PL", "林舟", "123456"))
+        self.assertTrue(all(field.isReadOnly() for field in (dialog.identity, dialog.name, dialog.password)))
+        self.assertTrue(dialog.change_button.isEnabled())
+        self.assertEqual(self.lobby.campaign_title.contextMenuPolicy(), Qt.ContextMenuPolicy.NoContextMenu)
+        self.assertFalse(hasattr(self.player, "_identity_menu"))
+        self.assertFalse(hasattr(self.player, "logout_button"))
+        self.assertFalse(hasattr(self.player, "_logout"))
+        sidebar = self.lobby.connection_button.parentWidget().layout()
+        self.assertEqual(sidebar.indexOf(self.lobby.personal_info_button) + 1, sidebar.indexOf(self.lobby.connection_button))
+        new_password = "修改后的密码123"
+
+        def fill():
+            change = self.player.findChild(PasswordDialog)
+            change.new_password.setText(new_password)
+            change.confirm_password.setText(new_password)
+            change.accept()
+
+        QTimer.singleShot(0, fill)
+        dialog.change_button.click()
+        self.wait(lambda: not self.player._busy)
+        self.assertEqual(dialog.password.text(), new_password)
+        self.assertEqual(self.player.history.entries()[0]["password"], new_password)
+        self.assertEqual(dialog.feedback.text(), "密码已更新。")
+        self.assertTrue(self.lobby.is_online)
+        self.player.close()
+        self.server.stop()
+        self.wait(lambda: not self.server.active)
+        reopened = PlayerWindow(QSettings(str(self.root / "player.ini"), QSettings.Format.IniFormat))
+        self.players.append(reopened)
+        reopened.login_button.click()
+        self.wait(lambda: reopened.lobby is not None and not reopened._busy)
+        reopened.lobby.personal_info_button.click()
+        offline_info = reopened.personal_info_dialog
+        self.assertEqual(offline_info.password.text(), new_password)
+        self.assertEqual(offline_info.name.text(), "林舟")
+        self.assertFalse(offline_info.change_button.isEnabled())
+        self.assertFalse(self.player.personal_info_dialog.isVisible())
+        self.assertEqual(self.player.personal_info_dialog.password.text(), "")
+
+    def test_rejected_password_change_keeps_verified_password(self):
+        self.lobby.personal_info_button.click()
+        dialog = self.player.personal_info_dialog
+
+        def fill():
+            change = self.player.findChild(PasswordDialog)
+            change.current_password.setText("错误的原密码")
+            change.new_password.setText("不能保存的新密码")
+            change.confirm_password.setText("不能保存的新密码")
+            change.accept()
+
+        QTimer.singleShot(0, fill)
+        dialog.change_button.click()
+        self.wait(lambda: not self.player._busy)
+        self.assertEqual(dialog.password.text(), "123456")
+        self.assertEqual(self.player.history.entries()[0]["password"], "123456")
+        self.assertTrue(dialog.feedback.isVisible())
+        self.assertNotEqual(dialog.feedback.text(), "密码已更新。")
+        self.assertTrue(dialog.change_button.isEnabled())

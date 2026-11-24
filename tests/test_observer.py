@@ -12,6 +12,8 @@ from host.channels import archive_scene, create_scene, get_channel_access, move_
 from host.management import add_member, edit_member, list_members
 from host.messages import ChatSendError, lobby_history, save_lobby_message
 from host.storage import campaign_info, initialize_campaign, open_campaign
+from tests.legacy_channel import seed_legacy_scene
+from tests.attribute_fixtures import add_ready_player
 
 
 class ObserverTests(unittest.TestCase):
@@ -19,7 +21,7 @@ class ObserverTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = initialize_campaign(Path(self.temp.name), "旁观团")
-        self.pl = add_member(self.directory, "调查员")
+        self.pl = add_ready_player(self.directory, "调查员")
         self.ob = add_member(self.directory, "看客", role="ob", password="观众密码")
         self.auth = AuthService(self.directory)
         self.token = self.auth.login("旁观团", "看客", "观众密码", "ob")["token"]
@@ -54,14 +56,13 @@ class ObserverTests(unittest.TestCase):
         with self.assertRaises(ChatSendError) as refused:
             save_lobby_message(self.directory, "forged", "插入故事", token=self.token, channel_id=scene)
         self.assertEqual(refused.exception.code, "channel_forbidden")
-        for operation in (
-            lambda: move_members(self.directory, [self.ob], scene),
-            lambda: create_scene(self.directory, "错误分组", [self.ob]),
-        ):
-            with self.assertRaises(ValueError):
-                operation()
+        with self.assertRaises(ValueError):
+            move_members(self.directory, [self.ob], scene)
+        another = create_scene(self.directory, "OB 同时参与", [self.ob])
+        with self.assertRaises(ChatSendError):
+            save_lobby_message(self.directory, "ob-member-readonly", "仍然不能发言", token=self.token, channel_id=another)
         with open_campaign(self.directory) as connection:
-            self.assertFalse(get_channel_access(connection, self.pl, message["channel_id"]).can_send)
+            self.assertTrue(get_channel_access(connection, self.pl, message["channel_id"]).can_send)
         other = initialize_campaign(Path(self.temp.name), "其他团")
         with open_campaign(other) as connection:
             foreign_channel = campaign_info(connection)["lobby_id"]
@@ -101,7 +102,7 @@ class ObserverTests(unittest.TestCase):
             pl = add_member(directory, "老角色")
             auth = AuthService(directory)
             token = auth.login("旧团", "老角色", "123456")["token"]
-            scene = create_scene(directory, "旧场景", [pl])
+            scene = seed_legacy_scene(directory, "旧场景", [pl])
             message, _ = save_lobby_message(directory, "old", "旧消息", token=token, channel_id=scene)
         with open_campaign(directory) as connection:
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])

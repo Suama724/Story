@@ -10,11 +10,13 @@ from .storage import DATABASE_NAME, campaign_info, create_member, member_name, o
 def list_members(directory: Path) -> list[dict[str, object]]:
     with open_campaign(directory) as connection:
         rows = connection.execute(
-            """SELECT m.id AS member_id, m.role, a.name AS actor_name,
+            """SELECT m.id AS member_id, m.role, a.name AS actor_name, attrs.actor_id IS NOT NULL AS attributes_imported,
                       CASE WHEN m.role IN ('pl', 'ob') AND c.password_hash IS NULL
                            THEN coalesce(c.password, ?) END AS password
                FROM members AS m
                JOIN actors AS a ON a.member_id = m.id AND a.kind IN ('kp', 'pc', 'ob')
+               JOIN campaigns AS campaign ON campaign.id = m.campaign_id
+               LEFT JOIN actor_attributes AS attrs ON attrs.actor_id = a.id AND attrs.ruleset = campaign.ruleset
                LEFT JOIN credentials AS c ON c.member_id = m.id
                ORDER BY m.role = 'kp' DESC, m.created_at, m.id""",
             (DEFAULT_PASSWORD,),

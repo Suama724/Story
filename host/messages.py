@@ -100,7 +100,7 @@ def save_lobby_message(
                 return dict(existing), False
 
             if not access.can_send:
-                raise ChatSendError("channel_forbidden")
+                raise ChatSendError("attributes_required" if access.attributes_required else "channel_forbidden")
 
             row = connection.execute(
                 """INSERT INTO messages

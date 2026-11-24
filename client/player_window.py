@@ -12,9 +12,12 @@ from PySide6.QtWidgets import (
 )
 
 from .auth_client import AuthClient, ClientSession, server_urls
+from .attribute_dialogs import AttributeImportDialog, AttributeSheetDialog
+from coc7_attributes import ATTRIBUTES, RESOURCES, SKILL_COLUMNS
 from .history_cache import HistoryCache
 from .lobby_window import DEFAULT_ADDRESS, LobbyWindow
 from .login_history import LoginHistory, offline_password_matches
+from .lobby_dialogs import PersonalInfoDialog
 
 ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 LOGIN_ERRORS = {
@@ -24,20 +27,7 @@ LOGIN_ERRORS = {
     "role_mismatch": "身份不匹配，请选择正确的 PL 或 OB。",
 }
 
-STYLE = """
-QWidget { color: #203548; font-size: 14px; }
-QWidget#player { background: #e9eef3; }
-QFrame#card { background: white; border: 1px solid #ccd6df; border-radius: 6px; }
-QLabel#title { font-size: 24px; font-weight: 600; }
-QLabel#muted { color: #687b8d; }
-QLineEdit, QPlainTextEdit, QComboBox { background: white; border: 1px solid #ccd6df; border-radius: 4px; padding: 7px; selection-background-color: #d5e8f8; }
-QLineEdit:focus, QPlainTextEdit:focus { border: 1px solid #326b97; }
-QPushButton { background: #f6f8fa; border: 1px solid #bbcbd8; border-radius: 4px; padding: 8px 14px; }
-QPushButton:hover { background: #e6eff7; }
-QPushButton:focus { border: 2px solid #326b97; }
-QPushButton#primary { background: #326b97; color: white; }
-QPushButton:disabled, QPushButton#primary:disabled { background: #edf1f5; color: #95a3af; border-color: #d5dee6; }
-"""
+from .ui_style import STYLE
 
 
 def label(text: str = "", name: str = "") -> QLabel:
@@ -169,10 +159,17 @@ class PlayerWindow(QWidget):
         self.auth = AuthClient(self)
         self.auth.completed.connect(self._auth_completed)
         self.auth.failed.connect(self._auth_failed)
+        self.attribute_client = AuthClient(self)
+        self.attribute_client.completed.connect(self._attributes_received)
+        self.attribute_client.failed.connect(self._attribute_request_failed)
+        self._attributes_busy = False
+        self._attribute_import = None
+        self._attribute_sheet = None
         self.session: ClientSession | None = None
         self.lobby: LobbyWindow | None = None
         self._busy = False
         self._pending_password = ""
+        self._current_password = ""
         self._offline_record: dict | None = None
         self.history = LoginHistory(settings)
         self._http = None
@@ -185,22 +182,10 @@ class PlayerWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
-        self.header = QWidget()
-        header = QHBoxLayout(self.header)
-        header.setContentsMargins(0, 0, 0, 0)
-        self.identity = label("", "muted")
-        header.addWidget(self.identity)
-        header.addStretch()
-        self.logout_button = QPushButton("退出登录")
-        self.logout_button.clicked.connect(self._logout)
-        self.change_button = QPushButton("修改密码")
+        self.personal_info_dialog = PersonalInfoDialog(self)
+        self.personal_info_dialog.attributes_button.clicked.connect(self._request_attributes)
+        self.change_button = self.personal_info_dialog.change_button
         self.change_button.clicked.connect(self._change_password)
-        self.nickname_button = QPushButton("修改昵称")
-        self.nickname_button.clicked.connect(self._change_nickname)
-        header.addWidget(self.nickname_button)
-        header.addWidget(self.change_button)
-        header.addWidget(self.logout_button)
-        layout.addWidget(self.header)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._login_page())
         layout.addWidget(self.pages, 1)
@@ -333,6 +318,7 @@ class PlayerWindow(QWidget):
     def _open_local_history(self, record: dict) -> None:
         self._http, self._websocket = server_urls(record["address"])
         self._offline_record = record
+        self._current_password = self.password.text()
         self.password.clear()
         self.feedback.setText("正在查看本机已同步的历史。" if self._lobby_identity() else "本机暂无已同步的历史。")
         self._enter_lobby()
@@ -383,13 +369,15 @@ class PlayerWindow(QWidget):
         if self._busy or not self.change_button.isEnabled():
             return
         session = self.session
-        dialog = PasswordDialog(self)
+        dialog = PasswordDialog(self.personal_info_dialog)
+        dialog.current_password.setText(self._current_password)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         current_password, new_password = dialog.current_password.text(), dialog.new_password.text()
         dialog.deleteLater()
         if not accepted or self.session is not session or self._busy:
             return
         self._pending_password = new_password
+        self.personal_info_dialog.set_feedback("正在修改密码…")
         self._request("password", {
             "current_password": current_password, "new_password": new_password,
         })
@@ -410,12 +398,13 @@ class PlayerWindow(QWidget):
             if self._offline_record is not None:
                 identity = self._lobby_identity()
                 if identity is not None and (session.campaign_id, session.member_id) != identity:
-                    self.feedback.setText("主机上的团或角色已变更，请返回登录页重新选择。")
+                    self.feedback.setText("主机上的团或角色已变更，请关闭窗口后重新选择身份。")
                     self.password.clear()
                     self._update_controls()
                     return
             self.session = session
-            self._save_login(self.password.text())
+            self._current_password = self.password.text()
+            self._save_login(self._current_password)
             self.password.clear()
             if self._offline_record is not None:
                 self._offline_record = None
@@ -425,11 +414,13 @@ class PlayerWindow(QWidget):
                 self._enter_lobby()
         elif operation == "password":
             if response.get("changed") is True:
+                self._current_password = self._pending_password
                 self.feedback.setText("密码已更新。")
-                self._save_login(self._pending_password)
+                self._save_login(self._current_password)
             else:
                 self.feedback.setText("主机返回了无法识别的改密结果。")
             self._pending_password = ""
+            self.personal_info_dialog.set_feedback(self.feedback.text())
         elif operation == "nickname":
             self.session = replace(self.session, actor_name=response["actor_name"])
             self.lobby.session = self.session
@@ -437,22 +428,23 @@ class PlayerWindow(QWidget):
             self.history.rename(self.session)
             self._show_lobby_identity(self.session.campaign_name, self.session.actor_name)
             self.feedback.setText("昵称已更新，下次登录请使用新昵称。")
-        elif operation == "logout":
-            self._reset_login("已退出登录。")
+        if self.lobby is not None and self.feedback.text():
+            self.lobby.feedback.setText(self.feedback.text())
         self._update_controls()
 
     def _auth_failed(self, operation: str, code: str, message: str) -> None:
+        if operation == "password":
+            self.personal_info_dialog.set_feedback(message)
         self._busy = False
         self._pending_password = ""
         if operation == "login":
             self._login_failed(code, message)
-        elif operation == "logout":
-            message = "已退出登录。" if code == "invalid_session" else "已清除本机登录，主机未确认退出。"
-            self._reset_login(message)
         elif code == "invalid_session":
             self._reset_login("会话已失效，请重新登录。")
         else:
             self.feedback.setText(message)
+        if self.lobby is not None and self.feedback.text():
+            self.lobby.feedback.setText(self.feedback.text())
         self._update_controls()
 
     def _login_failed(self, code: str, message: str) -> None:
@@ -499,12 +491,16 @@ class PlayerWindow(QWidget):
         key = self._lobby_identity()
         cache = self._history_cache(key) if key is not None else None
         self.lobby = LobbyWindow(session=self.session, address=self._websocket.toString(), cache=cache,
-                                 offline_actor=actor_name)
+                                 offline_actor=actor_name, campaign_name=campaign_name)
         self.lobby.loginRequested.connect(self._login_from_history)
         self.lobby.sessionRejected.connect(self._session_rejected)
         self.lobby.socket.stateChanged.connect(self._update_controls)
         if key is not None:
             self.lobby.restore_drafts(self._drafts.pop(key, {}))
+        self.lobby.personalInfoRequested.connect(self._open_personal_info)
+        self.lobby.attributesStatusChanged.connect(self._attributes_status_changed)
+        self.layout().setContentsMargins(0, 0, 0, 0)
+        self.layout().setSpacing(0)
         self.pages.addWidget(self.lobby)
         self.pages.setCurrentWidget(self.lobby)
         self._show_lobby_identity(campaign_name, actor_name)
@@ -516,7 +512,7 @@ class PlayerWindow(QWidget):
     def _adapt_lobby_size(self) -> None:
         self.layout().activate()
         minimum = self.minimumSizeHint().expandedTo(QSize(880, 620))
-        target = self.size().expandedTo(QSize(960, 720))
+        target = self.size().expandedTo(QSize(1280, 800))
         screen = self.screen()
         if screen is not None:
             available = screen.availableGeometry()
@@ -533,20 +529,24 @@ class PlayerWindow(QWidget):
                           max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1)))
 
     def _show_lobby_identity(self, campaign_name: str, actor_name: str) -> None:
-        role = self.session.role if self.session else (self._offline_record or {}).get("role", "pl")
-        self.identity.setText(f"[{campaign_name}]-{actor_name}" + (" · OB 观众" if role == "ob" else ""))
         self.setWindowTitle(f"Story · {actor_name}")
 
     def _leave_lobby(self) -> None:
+        self._close_attribute_dialogs()
+        self.personal_info_dialog.close()
+        self._current_password = ""
+        self.personal_info_dialog.set_identity("", "", "", can_change=False)
+        self.personal_info_dialog.set_feedback("")
         if self.lobby is not None:
             key = self._lobby_identity()
             if key is not None:
                 self._drafts[key] = self.lobby.saved_drafts()
-            self.lobby._close_connection()
+            self.lobby.shutdown()
             self.pages.removeWidget(self.lobby)
             self.lobby.deleteLater()
             self.lobby = None
-            self.header.hide()
+            self.layout().setContentsMargins(22, 20, 22, 18)
+            self.layout().setSpacing(12)
             self.setMinimumSize(self._login_minimum_size)
             if self._login_geometry is not None:
                 self.layout().activate()
@@ -566,7 +566,6 @@ class PlayerWindow(QWidget):
         self._pending_password = ""
         self._load_history()
         self.pages.setCurrentIndex(0)
-        self.identity.clear()
         self.setWindowTitle("参与者登录")
         self.feedback.setText(message)
         self._update_controls()
@@ -574,46 +573,132 @@ class PlayerWindow(QWidget):
     def _session_rejected(self) -> None:
         self._reset_login("会话已失效，请重新登录。未发送的草稿已保留。")
 
-    def _logout(self) -> None:
-        if self._busy:
-            return
-        if self._offline_record is not None:
-            self._reset_login("")
-            return
-        if self.session is None:
-            return
-        self._leave_lobby()
-        self.pages.setCurrentIndex(0)
-        self._request("logout")
-
     def _update_controls(self) -> None:
         for field in (
             self.saved_logins, self.address, self.campaign_name, self.actor_name,
             self.password, self.pl_role, self.ob_role, self.new_identity_button, self.manage_button,
         ):
             field.setEnabled(not self._busy)
-        for button in (self.login_button, self.change_button, self.logout_button):
-            button.setEnabled(not self._busy)
-        online = self.lobby is not None and self.lobby.socket.state() == QAbstractSocket.SocketState.ConnectedState
-        self.change_button.setEnabled(online and not self._busy)
-        self.change_button.setVisible(online)
-        is_ob = self.session is not None and self.session.role == "ob"
-        self.nickname_button.setVisible(is_ob)
-        self.nickname_button.setEnabled(online and is_ob and not self._busy)
-        self.logout_button.setText("返回登录" if self._offline_record is not None else "退出登录")
-        self.logout_button.setVisible(self.lobby is not None or self.session is not None)
-        self.header.setVisible(self.lobby is not None)
+        self.login_button.setEnabled(not self._busy)
+        self._update_personal_info()
+        self.feedback.setVisible(bool(self.feedback.text()) and self.lobby is None)
 
-    def _change_nickname(self) -> None:
-        if not self.nickname_button.isEnabled() or self.session is None:
+    def _update_personal_info(self) -> None:
+        profile = self._offline_record or {}
+        role = self.session.role if self.session is not None else profile.get("role", "")
+        name = self.session.actor_name if self.session is not None else profile.get("actor_name", "")
+        online = self.session is not None and self.lobby is not None and self.lobby.socket.state() == QAbstractSocket.SocketState.ConnectedState
+        self.personal_info_dialog.set_identity(role, name, self._current_password, can_change=online and not self._busy)
+        self.personal_info_dialog.setWindowTitle("个人属性" if role == "pl" else "个人信息")
+        button = self.personal_info_dialog.attributes_button
+        button.setVisible(role == "pl")
+        if self.lobby is not None:
+            self.lobby.personal_info_button.setText("个人属性" if role == "pl" else "个人信息")
+        imported = self.lobby.attributes_imported if self.lobby is not None else None
+        button.setText("导入属性" if imported is False else "查看属性")
+        button.setEnabled(role == "pl" and online and self.lobby.is_online and not self._attributes_busy)
+        button.setToolTip("" if online else "连接主机后可查看或导入属性。")
+
+    def _request_attributes(self) -> None:
+        if not self.personal_info_dialog.attributes_button.isEnabled():
             return
-        session = self.session
-        nickname, accepted = QInputDialog.getText(self, "修改 OB 昵称", "昵称", text=session.actor_name)
-        if accepted and self.session is session and not self._busy:
-            self._request("nickname", {"nickname": nickname})
+        self._attributes_busy = True
+        self.personal_info_dialog.set_feedback("")
+        self._update_personal_info()
+        self.attribute_client.request(self._http, "attributes", token=self.session.token)
+
+    def _submit_attributes(self, text: str) -> None:
+        if self._attributes_busy or self.session is None or not self.lobby.is_online:
+            self._attribute_import.set_pending(False, "请连接主机后重试。")
+            return
+        self._attributes_busy = True
+        self._update_personal_info()
+        self.attribute_client.request(self._http, "attributes", {"text": text}, self.session.token)
+
+    def _attributes_received(self, _operation: str, response: dict) -> None:
+        self._attributes_busy = False
+        if self.session is None or self.lobby is None:
+            return
+        values = response.get("attributes")
+        actor_name = response.get("actor_name")
+        required = {key for key, _ in (*ATTRIBUTES[:8], *RESOURCES)}
+        required.update(name for column in SKILL_COLUMNS for name, _ in column)
+        if ("attributes" not in response or not isinstance(actor_name, str)
+                or (values is not None and (not isinstance(values, dict) or not required.issubset(values)
+                    or any(type(value) is not int or value < 0 for value in values.values())))):
+            self._attribute_request_failed("attributes", "invalid_response", "主机返回的属性格式无效。")
+            return
+        self._update_personal_info()
+        if not self.personal_info_dialog.isVisible():
+            return
+        if values is None:
+            if self._attribute_import is None:
+                dialog = AttributeImportDialog(self.personal_info_dialog)
+                self._attribute_import = dialog
+                dialog.finished.connect(self._attribute_import_closed)
+                dialog.finished.connect(dialog.deleteLater)
+                dialog.importRequested.connect(self._submit_attributes)
+                dialog.open()
+            return
+        if self._attribute_import is not None:
+            self._attribute_import.accept()
+        if self._attribute_sheet is not None:
+            self._attribute_sheet.close()
+        dialog = AttributeSheetDialog(self.personal_info_dialog, actor_name, values)
+        self._attribute_sheet = dialog
+        dialog.finished.connect(self._attribute_sheet_closed)
+        dialog.finished.connect(dialog.deleteLater)
+        dialog.open()
+
+    def _attribute_import_closed(self) -> None:
+        self._attribute_import = None
+
+    def _attribute_sheet_closed(self) -> None:
+        self._attribute_sheet = None
+
+    def _attribute_request_failed(self, _operation: str, code: str, message: str) -> None:
+        self._attributes_busy = False
+        if code == "invalid_session":
+            self._session_rejected()
+            return
+        if code == "attributes_exist" and self._attribute_import is not None:
+            self._attribute_import.reject()
+            self._update_personal_info()
+            self._request_attributes()
+            return
+        if self._attribute_import is not None:
+            self._attribute_import.set_pending(False, message)
+        else:
+            self.personal_info_dialog.set_feedback(message)
+        self._update_personal_info()
+
+    def _attributes_status_changed(self) -> None:
+        if self.lobby.attributes_imported is False and self._attribute_sheet is not None:
+            self._attribute_sheet.close()
+            self.personal_info_dialog.set_feedback("KP 已重置角色属性，请重新导入。")
+        self._update_personal_info()
+
+    def _close_attribute_dialogs(self) -> None:
+        self.attribute_client.cancel()
+        self._attributes_busy = False
+        for dialog in (self._attribute_import, self._attribute_sheet):
+            if dialog is not None:
+                dialog.close()
+
+    def _open_personal_info(self) -> None:
+        if self.lobby is None:
+            return
+        self._update_personal_info()
+        self.personal_info_dialog.show()
+        self.personal_info_dialog.raise_()
+        self.personal_info_dialog.activateWindow()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._close_attribute_dialogs()
+        self.personal_info_dialog.close()
+        self._current_password = ""
+        self.personal_info_dialog.set_identity("", "", "", can_change=False)
         self.auth.cancel()
         if self.lobby is not None:
-            self.lobby._close_connection()
+            self.lobby.shutdown()
         event.accept()

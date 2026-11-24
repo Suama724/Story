@@ -8,6 +8,8 @@ from PySide6.QtNetwork import QAbstractSocket, QNetworkProxy, QNetworkRequest
 from PySide6.QtWebSockets import QWebSocket, QWebSocketProtocol
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -38,6 +40,22 @@ from chat_protocol import (
 from .auth_client import AuthClient, ClientSession, server_urls
 from .chat_history import ChatHistory
 from .history_cache import HistoryCache, is_saved_message
+from .channel_tree import ChannelTree
+from .ui_style import STYLE
+from .host_monitor import HostMonitor
+from .lobby_dialogs import ChannelLogDialog, ChannelMembersDialog
+
+LOBBY_STYLE = """
+QWidget#participantLobby { background: white; color: #203548; font-size: 14px; }
+QFrame#participantSidebar { background: #e9eef3; border-right: 1px solid #ccd6df; }
+QFrame#participantHeader { background: white; border-bottom: 1px solid #ccd6df; }
+QLabel#heading { font-size: 20px; font-weight: 600; }
+QLabel#muted { color: #687b8d; }
+QTreeWidget#channelTree { background: transparent; border: none; outline: none; }
+QTreeWidget#channelTree::item { padding: 4px 2px; border-radius: 4px; }
+QTreeWidget#channelTree::item:selected { background: #d5e8f8; color: #203548; }
+"""
+
 
 SocketState = QAbstractSocket.SocketState
 
@@ -54,14 +72,26 @@ STATE_LABELS = {
 }
 
 
+class FeedbackLabel(QLabel):
+    def setText(self, text):
+        super().setText(text)
+        self.setVisible(bool(text))
+
+    def clear(self):
+        super().clear()
+        self.hide()
+
+
 class LobbyWindow(QWidget):
     """带频道权限、历史同步和草稿隔离的聊天窗口。"""
 
     sessionRejected = Signal()
     loginRequested = Signal()
+    personalInfoRequested = Signal()
+    attributesStatusChanged = Signal()
 
     def __init__(self, *, session: ClientSession | None = None, address: str = DEFAULT_ADDRESS,
-                 cache: HistoryCache | None = None, offline_actor: str = "") -> None:
+                 cache: HistoryCache | None = None, offline_actor: str = "", campaign_name: str = "") -> None:
         super().__init__()
         self.session = session
         self._managed = session is not None or bool(offline_actor)
@@ -69,9 +99,18 @@ class LobbyWindow(QWidget):
         self._base_cache = cache
         self._channels: dict[str, dict] = {}
         self._channel_id = ""
+        self._history_has_more = False
+        self._host_open = True if session is not None else None
+        self._host_monitor = None
+        self._log_dialogs = {}
+        self._members_dialogs = {}
+        self._info_dialogs = {}
+        self._log_requests = {}
+        self._campaign_name = session.campaign_name if session is not None else campaign_name
         self._assigned_channel_id = ""
         self._channel_drafts: dict[str, tuple[str, tuple[str, str] | None]] = {}
         self._channel_state_ready = False
+        self.attributes_imported: bool | None = None
         self._channel_timer = QTimer(self)
         self._channel_timer.setSingleShot(True)
         self._channel_timer.timeout.connect(self._channel_state_timed_out)
@@ -106,34 +145,36 @@ class LobbyWindow(QWidget):
         self.address = QLineEdit(address)
         self.nickname = QLineEdit()
         self.nickname.setPlaceholderText("输入临时昵称")
-        self.connect_button = QPushButton("连接")
-        self.disconnect_button = QPushButton("断开")
+        if self._managed:
+            self.connection_button = QPushButton("连接")
+            self.connection_button.setObjectName("primary")
+            self.connect_button = self.disconnect_button = self.connection_button
+        else:
+            self.connect_button = QPushButton("连接")
+            self.disconnect_button = QPushButton("断开")
         self.connection_status = QLabel()
-        self.channel_choice = QComboBox()
-        self.channel_choice.setVisible(self._managed)
+        self.channel_choice = ChannelTree(managed=False) if self._managed else QComboBox()
+        if not self._managed:
+            self.channel_choice.hide()
         self.channel_choice.currentIndexChanged.connect(self._select_channel)
-        self.channel_status = QLabel()
-        self.channel_status.setTextFormat(Qt.TextFormat.PlainText)
-        self.channel_status.setVisible(self._managed)
-        self.feedback = QLabel()
+        self.feedback = FeedbackLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
         self.feedback.setWordWrap(True)
         self.chat_history = ChatHistory()
         self.chat_history.setPlaceholderText("暂无可查看的消息")
-        self.older_button = QPushButton("查看更早消息")
-        self.older_button.clicked.connect(self._load_older)
-        self.older_button.setVisible(cache is not None)
+        self.chat_history.olderRequested.connect(self._load_older)
         self.message = QPlainTextEdit()
         self.message.setPlaceholderText("输入消息")
         self.message.setFixedHeight(80)
         self.send_button = QPushButton("发送")
+        self.send_button.setObjectName("primary")
         self._awaiting_send = False
         self.retry_send: tuple[str, str] | None = None
         if self._managed:
             self.nickname.setText(session.actor_name if session is not None else offline_actor)
             self.nickname.setReadOnly(True)
             self.address.setReadOnly(True)
-            self.connect_button.setText("重新连接")
+
 
         self._build_layout()
         self._connect_signals()
@@ -147,6 +188,11 @@ class LobbyWindow(QWidget):
                     self._show_cached_page()
             except (OSError, sqlite3.Error, ValueError):
                 self.feedback.setText("无法读取本地频道信息。")
+        campaign_id = session.campaign_id if session is not None else self._base_cache.scope[0] if self._base_cache is not None else None
+        if self._managed and campaign_id is not None:
+            self._host_monitor = HostMonitor(address, campaign_id, self)
+            self._host_monitor.changed.connect(self._host_state_changed)
+            self._host_monitor.start()
 
     def resume(self, session: ClientSession, cache: HistoryCache) -> None:
         self.session = session
@@ -154,43 +200,233 @@ class LobbyWindow(QWidget):
         if self._cache is None:
             self._base_cache = cache
             self._cache = cache
-            self.older_button.show()
             self._show_cached_page()
         self._open_connection()
 
     def _build_layout(self) -> None:
-        connection_row = QHBoxLayout()
-        connection_row.addWidget(QLabel("主机地址"))
-        connection_row.addWidget(self.address, stretch=1)
-        connection_row.addWidget(QLabel("角色 / 昵称" if self._managed else "昵称"))
-        connection_row.addWidget(self.nickname)
-        connection_row.addWidget(self.connect_button)
-        connection_row.addWidget(self.disconnect_button)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(connection_row)
-        layout.addWidget(self.connection_status)
-        layout.addWidget(self.channel_choice)
-        layout.addWidget(self.channel_status)
-        layout.addWidget(self.feedback)
-        self.history_label = QLabel("大厅消息")
-        layout.addWidget(self.history_label)
-        layout.addWidget(self.older_button)
-        layout.addWidget(self.chat_history, stretch=1)
-        layout.addWidget(self.message)
-        layout.addWidget(self.send_button)
+        if not self._managed:
+            connection_row = QHBoxLayout()
+            for field in (self.address, self.nickname, self.connect_button, self.disconnect_button):
+                connection_row.addWidget(field)
+            layout = QVBoxLayout(self)
+            layout.addLayout(connection_row)
+            layout.addWidget(self.connection_status)
+            layout.addWidget(self.feedback)
+            self.history_label = QLabel("大厅消息")
+            layout.addWidget(self.history_label)
+            layout.addWidget(self.chat_history, 1)
+            layout.addWidget(self.message)
+            layout.addWidget(self.send_button)
+            return
+        self.setObjectName("participantLobby")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(STYLE + LOBBY_STYLE)
+        self.address.setParent(self)
+        self.address.hide()
+        self.nickname.setParent(self)
+        self.nickname.hide()
+        columns = QHBoxLayout(self)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(0)
+        sidebar = QFrame()
+        sidebar.setObjectName("participantSidebar")
+        sidebar.setFixedWidth(240)
+        left = QVBoxLayout(sidebar)
+        left.setContentsMargins(16, 16, 16, 16)
+        left.setSpacing(12)
+        self.campaign_title = QLabel(self._campaign_name)
+        self.campaign_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.campaign_title.setObjectName("heading")
+        self.campaign_title.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        left.addWidget(self.campaign_title)
+        left.addWidget(self.connection_status)
+        left.addSpacing(16)
+        left.addWidget(self.channel_choice, 1)
+        self.personal_info_button = QPushButton("个人信息")
+        self.personal_info_button.clicked.connect(lambda _checked=False: self.personalInfoRequested.emit())
+        left.addWidget(self.personal_info_button)
+        left.addWidget(self.connection_button)
+        columns.addWidget(sidebar)
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(0)
+        header = QFrame()
+        header.setObjectName("participantHeader")
+        header.setFixedHeight(104)
+        top = QHBoxLayout(header)
+        top.setContentsMargins(24, 16, 24, 16)
+        top.setSpacing(16)
+        self.history_label = QLabel()
+        self.history_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.history_label.setObjectName("heading")
+        self.history_label.setFixedWidth(220)
+        top.addWidget(self.history_label)
+        self.channel_info_button = QPushButton("频道简介")
+        self.channel_info_button.clicked.connect(self._open_channel_info)
+        self.channel_members_button = QPushButton("频道成员")
+        self.channel_members_button.clicked.connect(self._open_channel_members)
+        self.channel_log_button = QPushButton("log")
+        self.channel_log_button.clicked.connect(self._open_channel_log)
+        for button in (self.channel_info_button, self.channel_members_button, self.channel_log_button):
+            top.addWidget(button)
+        top.addStretch()
+        right.addWidget(header)
+        chat = QVBoxLayout()
+        chat.setContentsMargins(20, 16, 20, 16)
+        chat.setSpacing(10)
+        chat.addWidget(self.chat_history, 1)
+        chat.addWidget(self.message)
+        chat.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignRight)
+        self.feedback.hide()
+        chat.addWidget(self.feedback)
+        right.addLayout(chat, 1)
+        columns.addLayout(right, 1)
 
     def _connect_signals(self) -> None:
-        self.connect_button.clicked.connect(self._open_connection)
+        if self._managed:
+            self.connection_button.clicked.connect(self._toggle_connection)
+        else:
+            self.connect_button.clicked.connect(self._open_connection)
+            self.disconnect_button.clicked.connect(self._close_connection)
         self.address.returnPressed.connect(self._open_connection)
         self.nickname.returnPressed.connect(self._open_connection)
-        self.disconnect_button.clicked.connect(self._close_connection)
         self.send_button.clicked.connect(self._send_message)
         self.socket.stateChanged.connect(self._update_connection_state)
         self.socket.connected.connect(self._connected)
         self.socket.textMessageReceived.connect(self._show_message)
         self.socket.errorOccurred.connect(self._show_socket_error)
         self.socket.pong.connect(self._pong_received)
+
+    @property
+    def is_online(self):
+        return self.socket.state() == SocketState.ConnectedState and self._channel_state_ready
+
+    def _toggle_connection(self):
+        if self._reconnect_timer.isActive() or self.socket.state() != SocketState.UnconnectedState:
+            self._close_connection()
+        else:
+            self._open_connection()
+
+    def _host_state_changed(self, state):
+        self._host_open = state
+        self._update_status_label()
+
+    def _update_status_label(self):
+        connected = self.socket.state() == SocketState.ConnectedState
+        if not self._managed:
+            self.connection_status.setText(STATE_LABELS.get(self.socket.state(), "正在连接…"))
+            return
+        opened = "已开启" if connected or self._host_open is True else "未开启" if self._host_open is False else "检测中"
+        self.connection_status.setText(opened + "-" + ("已连接" if connected else "未连接"))
+
+    @staticmethod
+    def _show_dialog(dialog):
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _refresh_channel_info(self):
+        if self.is_online:
+            self.socket.sendTextMessage(json.dumps({"type": CHANNEL_STATE_GET}))
+
+    def _open_channel_info(self):
+        if self._channel_id not in self._channels:
+            return
+        dialog = self._info_dialogs.get(self._channel_id)
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.resize(520, 320)
+            dialog.content = QPlainTextEdit()
+            dialog.content.setReadOnly(True)
+            dialog.content.setPlaceholderText("暂无本地简介")
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(dialog.content)
+            self._info_dialogs[self._channel_id] = dialog
+        self._update_auxiliary_windows()
+        self._show_dialog(dialog)
+        self._refresh_channel_info()
+
+    def _open_channel_members(self):
+        if self._channel_id not in self._channels:
+            return
+        dialog = self._members_dialogs.get(self._channel_id)
+        if dialog is None:
+            dialog = ChannelMembersDialog(self, self._channel_id)
+            self._members_dialogs[self._channel_id] = dialog
+        self._update_auxiliary_windows()
+        self._show_dialog(dialog)
+        self._refresh_channel_info()
+
+    def _open_channel_log(self):
+        if self._channel_id not in self._channels:
+            return
+        dialog = self._log_dialogs.get(self._channel_id)
+        if dialog is None:
+            dialog = ChannelLogDialog(self, self._channel_id)
+            self._log_dialogs[self._channel_id] = dialog
+        self._update_auxiliary_windows()
+        self._show_dialog(dialog)
+        dialog.load()
+
+    def _update_auxiliary_windows(self):
+        if not self._managed:
+            return
+        for mapping in (self._info_dialogs, self._members_dialogs, self._log_dialogs):
+            for key, dialog in list(mapping.items()):
+                channel = self._channels.get(key)
+                if channel is None:
+                    if mapping is self._log_dialogs:
+                        self._cancel_log_requests(dialog)
+                        dialog.timer.stop()
+                        dialog.history.clear()
+                    dialog.close()
+                    dialog.deleteLater()
+                    del mapping[key]
+                    continue
+                if mapping is self._info_dialogs:
+                    dialog.setWindowTitle(channel["name"] + " · 频道简介" + ("" if self.is_online else " · 本地资料"))
+                    dialog.content.setPlainText(channel.get("description", ""))
+                elif mapping is self._members_dialogs:
+                    dialog.update_channel(channel, self.is_online)
+                else:
+                    dialog.setWindowTitle(channel["name"] + (" · 聊天记录" if self.is_online else " · 本地聊天记录"))
+        for button in (self.channel_info_button, self.channel_members_button, self.channel_log_button):
+            button.setEnabled(self._channel_id in self._channels)
+
+    def _cancel_log_requests(self, dialog):
+        self._log_requests = {key: value for key, value in self._log_requests.items() if value[0] is not dialog}
+
+    def _request_log_history(self, dialog, before):
+        request_id = str(uuid4())
+        mode, cursor = ("before", before) if before is not None else ("latest", 0)
+        self._log_requests[request_id] = (dialog, mode, cursor)
+        payload = {"type": CHAT_HISTORY_GET, "channel_id": dialog.channel_id,
+                   "request_id": request_id, "mode": mode, "cursor": cursor}
+        if self.socket.sendTextMessage(json.dumps(payload)) <= 0:
+            dialog.fail("无法请求聊天记录。")
+        else:
+            dialog.timer.start(5000)
+
+    def _receive_log_history(self, event):
+        dialog, mode, cursor = self._log_requests.get(event["request_id"])
+        if event.get("channel_id") != dialog.channel_id or (event.get("mode"), event.get("cursor")) != (mode, cursor):
+            return
+        page = event.get("messages")
+        if (dialog.channel_id not in self._channels or not isinstance(page, list) or len(page) > HISTORY_PAGE_SIZE
+                or not all(is_saved_message(item) and item.get("channel_id") == dialog.channel_id for item in page)):
+            dialog.fail("无法读取该频道记录。")
+            return
+        sequences = [item["sequence"] for item in page]
+        if sequences != sorted(set(sequences)) or (mode == "before" and sequences and sequences[-1] >= cursor):
+            dialog.fail("聊天记录顺序无效。")
+            return
+        cache = dialog.cache()
+        if cache is not None:
+            try:
+                cache.save(page)
+            except (OSError, sqlite3.Error):
+                self.feedback.setText("本地记录保存失败。")
+        dialog.apply(page, event.get("has_more") is True, replace=mode == "latest")
 
     @Slot()
     def _open_connection(self) -> None:
@@ -246,8 +482,6 @@ class LobbyWindow(QWidget):
         else:
             self.socket.abort()
         self._update_connection_state(self.socket.state())
-        if self.session is not None and self.retry_send is None:
-            self.feedback.setText("已断开，可以手动重新连接。")
 
     def _connection_timed_out(self) -> None:
         self.feedback.setText("连接主机超时。")
@@ -292,12 +526,24 @@ class LobbyWindow(QWidget):
         status = STATE_LABELS.get(state, "正在连接…")
         if reconnecting:
             status = f"正在重连（{self._retry_count}/{len(RECONNECT_DELAYS_MS)}）…"
-        self.connection_status.setText(status)
+        if self._managed:
+            if connected:
+                self._host_open = True
+            self._update_status_label()
+            self.connection_button.setText("取消重连" if waiting_to_retry else "断开连接" if connected or not idle else "连接")
+            self.connection_button.setEnabled(state != SocketState.ClosingState)
+            self.connection_button.setToolTip(status)
+        else:
+            self.connection_status.setText(status)
         self.address.setEnabled(idle)
         self.nickname.setEnabled(idle)
-        self.connect_button.setEnabled(idle and not self._connection_active and not waiting_to_retry)
-        self.disconnect_button.setEnabled(waiting_to_retry or (not idle and state != SocketState.ClosingState))
+        if not self._managed:
+            self.connect_button.setEnabled(idle and not self._connection_active and not waiting_to_retry)
+            self.disconnect_button.setEnabled(waiting_to_retry or (not idle and state != SocketState.ClosingState))
         if not connected:
+            for dialog in self._log_dialogs.values():
+                if dialog.loading:
+                    dialog.fail("连接已断开，可查看本地记录。")
             self._channel_state_ready = False
             self._channel_timer.stop()
             self._finish_history_request()
@@ -309,6 +555,7 @@ class LobbyWindow(QWidget):
             # 等待 Qt 更新关闭码，握手失败也可能只发出状态或错误信号。
             QTimer.singleShot(0, self, self._connection_lost)
 
+        self._update_auxiliary_windows()
         self._update_send_controls()
 
     def _update_send_controls(self) -> None:
@@ -316,6 +563,16 @@ class LobbyWindow(QWidget):
         can_send = not self._managed or (self._channel_state_ready and self._channels.get(self._channel_id, {}).get("can_send") is True)
         self.send_button.setEnabled(connected and can_send and not self._awaiting_send)
         self.message.setReadOnly(self._awaiting_send or (self._managed and (not connected or not can_send)))
+        if self._managed:
+            channel = self._channels.get(self._channel_id, {})
+            if not connected:
+                placeholder = "未连接"
+            elif channel.get("attributes_required") is True:
+                placeholder = "请先在「个人属性」中导入角色属性"
+            else:
+                placeholder = f"发送到 {channel.get('name', '')}" if can_send else "频道只读"
+            self.message.setPlaceholderText(placeholder)
+        self.chat_history.set_pagination(self._history_has_more, self._history_request is not None)
 
     def _connected(self) -> None:
         self._opening = False
@@ -356,6 +613,7 @@ class LobbyWindow(QWidget):
         self._awaiting_send = False
 
     def _apply_channel_state(self, state: dict, *, online: bool = True) -> None:
+        previous_ranges = {key: channel["history_ranges"] for key, channel in self._channels.items()}
         channels = state.get("channels")
         if not isinstance(channels, list) or not all(
             isinstance(item, dict) and isinstance(item.get("channel_id"), str)
@@ -372,9 +630,11 @@ class LobbyWindow(QWidget):
         previous = self._channels.get(self._channel_id)
         was_ready = self._channel_state_ready
         selected = self._channel_id
-        if assigned != self._assigned_channel_id or selected not in available:
+        if (state.get("membership_mode") != "multiple" and assigned != self._assigned_channel_id) or selected not in available:
             selected = assigned
-        changed = selected != self._channel_id or previous != available[selected]
+        changed = selected != self._channel_id or previous is None or any(
+            previous.get(key) != available[selected].get(key) for key in ("history_ranges", "can_read", "status")
+        )
         if changed or not was_ready:
             self._store_draft()
             self._finish_history_request()
@@ -391,11 +651,9 @@ class LobbyWindow(QWidget):
         if "" in self._channel_drafts:
             self._channel_drafts[lobby_id] = self._channel_drafts.pop("")
         self.channel_choice.blockSignals(True)
-        self.channel_choice.clear()
-        for item in available.values():
-            suffix = "（归档）" if item["status"] == "archived" else ""
-            self.channel_choice.addItem(item["name"] + suffix, item["channel_id"])
-        self.channel_choice.setCurrentIndex(self.channel_choice.findData(selected))
+        groups = state.get("groups") or [{"group_id": "default", "name": "频道"}]
+        nav_channels = [dict(item, group_id=item.get("group_id") or groups[0]["group_id"]) for item in available.values()]
+        self.channel_choice.set_channels(groups, nav_channels, selected)
         self.channel_choice.blockSignals(False)
         self._channel_id = selected
         self._set_channel_cache()
@@ -406,8 +664,22 @@ class LobbyWindow(QWidget):
         if changed or not was_ready:
             self._restore_draft()
         self._update_channel_status()
+        self._update_auxiliary_windows()
+        for key, dialog in self._log_dialogs.items():
+            if previous_ranges.get(key) != self._channels[key]["history_ranges"]:
+                self._cancel_log_requests(dialog)
+                dialog.timer.stop()
+                dialog.loading = dialog.loaded = dialog.has_more = False
+                dialog.pending_live.clear()
+                dialog.history.clear()
+                if dialog.isVisible():
+                    dialog.load()
         if online and (changed or not was_ready):
             self._sync_channel()
+        if online:
+            imported = state.get("attributes_imported")
+            self.attributes_imported = imported if type(imported) is bool else None
+            self.attributesStatusChanged.emit()
 
     def _set_channel_cache(self) -> None:
         if self._base_cache is not None and self._channel_id in self._channels:
@@ -417,14 +689,8 @@ class LobbyWindow(QWidget):
 
     def _update_channel_status(self) -> None:
         channel = self._channels.get(self._channel_id)
-        assigned = self._channels.get(self._assigned_channel_id)
-        if channel is not None and assigned is not None:
-            self.history_label.setText(f"{channel['name']}消息")
-            suffix = "可发言" if channel["can_send"] else "只读"
-            if self.session is not None and self.session.role == "ob":
-                self.channel_status.setText(f"OB 观众 · 正在查看 {channel['name']}（{suffix}） · 仅大厅可发言")
-            else:
-                self.channel_status.setText(f"当前分配 · {assigned['name']}    正在查看 · {channel['name']}（{suffix}）")
+        if channel is not None:
+            self.history_label.setText(channel["name"])
         self._update_send_controls()
 
     def _select_channel(self, _index: int) -> None:
@@ -479,23 +745,26 @@ class LobbyWindow(QWidget):
             page = self._cache.page(before)
         except (OSError, sqlite3.Error):
             self.feedback.setText("无法读取本地历史。")
+            self.chat_history.set_pagination(self._history_has_more)
             return False
         if require_contiguous and before is not None and page:
             # 本地可能缺了中间的一页，在线时让主机补齐这个缺口。
             if [item["sequence"] for item in page] != list(range(before - len(page), before)):
                 return False
         self.chat_history.add_messages(page)
-        if not page and before is not None and not require_contiguous:
-            self.feedback.setText("本地没有更早的消息。")
+        self._history_has_more = len(page) == HISTORY_PAGE_SIZE
+        self.chat_history.set_pagination(self._history_has_more)
         return bool(page)
 
     def _load_older(self) -> None:
         if self._cache is None or self._history_request is not None:
+            self.chat_history.set_pagination(self._history_has_more, self._history_request is not None)
             return
         before = self.chat_history.oldest_sequence
-        online = self.socket.state() == SocketState.ConnectedState
-        if not self._show_cached_page(before, require_contiguous=online) and online:
+        if self.is_online:
             self._request_history("latest" if before is None else "before", before or 0)
+        else:
+            self._show_cached_page(before)
 
     def _request_history(self, mode: str, cursor: int) -> None:
         self._history_request_id = str(uuid4())
@@ -506,13 +775,13 @@ class LobbyWindow(QWidget):
             self.feedback.setText("无法请求主机历史，已保留本地消息。")
             return
         self._history_request = (mode, cursor)
-        self.older_button.setEnabled(False)
+        self.chat_history.set_pagination(self._history_has_more, loading=True)
         self._history_timer.start(5000)
 
     def _finish_history_request(self) -> None:
         self._history_request = None
         self._history_timer.stop()
-        self.older_button.setEnabled(True)
+        self.chat_history.set_pagination(self._history_has_more)
 
     def _history_timed_out(self) -> None:
         self._finish_history_request()
@@ -520,6 +789,9 @@ class LobbyWindow(QWidget):
         self.feedback.setText("主机未返回历史记录，已保留本地消息。")
 
     def _show_history_page(self, event: dict) -> None:
+        if event.get("request_id") in self._log_requests:
+            self._receive_log_history(event)
+            return
         mode, cursor = event.get("mode"), event.get("cursor")
         if (self._history_request is None or (mode, cursor) != self._history_request
                 or event.get("channel_id") != self._channel_id
@@ -537,22 +809,29 @@ class LobbyWindow(QWidget):
             self._finish_sync()
             self.feedback.setText("主机返回的历史顺序无效。")
             return
+        if mode in ("latest", "before"):
+            self._history_has_more = event.get("has_more") is True
         synced_through = (sequences[-1] if sequences else cursor) if mode != "before" else None
         self._show_saved_messages(page, latest=mode == "latest", synced_through=synced_through)
         if mode == "after" and page and event.get("has_more") is True:
             self._request_history("after", sequences[-1])
         elif mode != "before":
             self._finish_sync()
-        elif not page:
-            self.feedback.setText("已到最早的消息。")
 
     def _finish_sync(self) -> None:
         messages, self._live_during_sync = self._live_during_sync, None
         if messages:
             self._show_saved_messages(messages)
+        self.chat_history.set_pagination(self._history_has_more, self._history_request is not None)
 
     def _show_live_message(self, message: dict) -> None:
         channel_id = message.get("channel_id")
+        dialog = self._log_dialogs.get(channel_id)
+        if dialog is not None:
+            if dialog.loaded:
+                dialog.history.add_message(message)
+            else:
+                dialog.pending_live.append(message)
         if self._managed and channel_id != self._channel_id:
             if channel_id in self._channels and self._base_cache is not None and is_saved_message(message):
                 try:
@@ -576,6 +855,7 @@ class LobbyWindow(QWidget):
             except (OSError, sqlite3.Error, UnicodeError):
                 self.feedback.setText("本地历史保存失败，仍可查看收到的消息。")
         self.chat_history.add_messages(messages)
+        self.chat_history.set_pagination(self._history_has_more, self._history_request is not None)
 
     @Slot()
     def _send_message(self) -> None:
@@ -649,6 +929,13 @@ class LobbyWindow(QWidget):
         if self._connection_active and self.socket.state() == SocketState.UnconnectedState:
             QTimer.singleShot(0, self, self._connection_lost)
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def shutdown(self):
+        if self._host_monitor is not None:
+            self._host_monitor.stop()
         self._close_connection()
+        for dialog in self.findChildren(QDialog):
+            dialog.close()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.shutdown()
         super().closeEvent(event)

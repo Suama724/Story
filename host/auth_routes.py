@@ -6,9 +6,27 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 
+from coc7_attributes import MAX_IMPORT_LENGTH
+from .attributes import player_attributes
 from .auth import AuthError, AuthService
+from .storage import campaign_info, open_campaign
 
 router = APIRouter(prefix="/auth")
+
+
+@router.get("/status")
+async def host_status(request: Request, response: Response) -> dict[str, object]:
+    """仅标识当前监听的团，不公开人物与凭据；供断开的客户端独立探测。"""
+    response.headers["Cache-Control"] = "no-store"
+    service = request.app.state.auth
+    if service is None:
+        return {"running": False, "campaign_id": None}
+
+    def read():
+        with open_campaign(service.directory) as connection:
+            return {"running": True, "campaign_id": campaign_info(connection)["campaign_id"]}
+
+    return await run_in_threadpool(read)
 
 
 class LoginRequest(BaseModel):
@@ -28,6 +46,11 @@ class PasswordRequest(BaseModel):
 class NicknameRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     nickname: str = Field(min_length=1, max_length=80)
+
+
+class AttributesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: SecretStr
 
 
 def bearer_token(authorization: str | None) -> str:
@@ -78,6 +101,31 @@ async def session_info(request: Request, response: Response) -> dict[str, object
     token = bearer_token(request.headers.get("authorization"))
     session = await run_in_threadpool(service.require_session, token)
     return session.public_info()
+
+
+@router.get("/attributes")
+async def read_attributes(request: Request, response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    service = auth_service(request)
+    token = bearer_token(request.headers.get("authorization"))
+    return await run_in_threadpool(player_attributes, service.directory, token)
+
+
+@router.post("/attributes")
+async def import_attributes(body: AttributesRequest, request: Request, response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    service = auth_service(request)
+    token = bearer_token(request.headers.get("authorization"))
+    text = body.text.get_secret_value()
+    if len(text) > MAX_IMPORT_LENGTH:
+        raise AuthError("invalid_attributes", "属性指令太长，请只复制人物卡的 .st 属性行。", 400)
+    async with request.app.state.lobby.lock:
+        session = await run_in_threadpool(service.require_session, token)
+        result = await run_in_threadpool(player_attributes, service.directory, token, text=text)
+        await request.app.state.lobby.channels_changed(member_id=session.member_id)
+        if request.app.state.on_attributes_changed is not None:
+            request.app.state.on_attributes_changed()
+    return result
 
 
 @router.post("/nickname")

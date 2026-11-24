@@ -15,7 +15,9 @@ class ServerController(QObject):
     sendConfirmed = Signal(str, object)
     sendFailed = Signal(str)
     passwordChanged = Signal()
+    attributesChanged = Signal()
     channelsReceived = Signal(str, object)
+    presenceReceived = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -99,8 +101,12 @@ class ServerController(QObject):
                 self.sendConfirmed.emit(str(event["request_id"]), event["message"])
             elif kind == "password_changed":
                 self.passwordChanged.emit()
+            elif kind == "attributes_changed":
+                self.attributesChanged.emit()
             elif kind == "channels":
                 self.channelsReceived.emit(str(event["request_id"]), event["state"])
+            elif kind == "presence":
+                self.presenceReceived.emit(event["member_ids"])
             elif kind == "error":
                 self._reported_error = True
                 if event.get("request_id") is not None:

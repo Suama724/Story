@@ -18,6 +18,8 @@ from host.channels import (
 from host.management import add_member
 from host.messages import ChatSendError, lobby_history, save_lobby_message
 from host.storage import campaign_info, initialize_campaign, open_campaign
+from tests.legacy_channel import seed_legacy_scene
+from tests.attribute_fixtures import add_ready_player
 
 
 class ChannelTests(unittest.TestCase):
@@ -25,8 +27,8 @@ class ChannelTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = initialize_campaign(Path(self.temporary.name), "分线团")
-        self.a = add_member(self.directory, "A")
-        self.b = add_member(self.directory, "B")
+        self.a = add_ready_player(self.directory, "A")
+        self.b = add_ready_player(self.directory, "B")
         self.auth = AuthService(self.directory)
         self.token_a = self.auth.login("分线团", "A", DEFAULT_PASSWORD)["token"]
         self.token_b = self.auth.login("分线团", "B", DEFAULT_PASSWORD)["token"]
@@ -73,17 +75,20 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_a, "after", 3, scene)["messages"]], [5])
         self.assertEqual([item["sequence"] for item in lobby_history(self.directory, self.token_a, "before", 5, scene)["messages"]], [2, 3])
 
-    def test_scene_creation_is_atomic_idempotent_and_rejects_occupied_members(self) -> None:
+    def test_scene_creation_is_atomic_idempotent_and_allows_parallel_memberships(self) -> None:
         scene = create_scene(self.directory, "地下室", [self.a], channel_id="scene-request")
         self.assertEqual(create_scene(self.directory, "地下室", [self.a], channel_id="scene-request"), scene)
-        for participants in ([self.b], [self.b, "missing"], [self.a]):
+        for participants in ([self.b], [self.b, "missing"]):
             with self.subTest(participants=participants), self.assertRaises(ValueError):
                 create_scene(self.directory, "另一间", participants, channel_id="scene-request" if participants == [self.b] else "other")
         with open_campaign(self.directory) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM channels WHERE kind = 'scene'").fetchone()[0], 1)
             lobby = campaign_info(connection)["lobby_id"]
-        with self.assertRaises(ChatSendError):
-            save_lobby_message(self.directory, "lobby-forgery", "回大厅发言", token=self.token_a, channel_id=lobby)
+        other = create_scene(self.directory, "另一间", [self.a])
+        for channel in (scene, other, lobby):
+            save_lobby_message(self.directory, f"parallel-{channel}", "多频道发言", token=self.token_a, channel_id=channel)
+        archive_scene(self.directory, scene)
+        save_lobby_message(self.directory, "still-in-other", "另一个频道仍可发言", token=self.token_a, channel_id=other)
 
     def test_v4_upgrade_preserves_messages_ids_and_defaults_to_secret(self) -> None:
         with patch.object(migrations, "SCHEMA_VERSION", 4):
@@ -201,7 +206,7 @@ class ChannelTests(unittest.TestCase):
         with patch.object(migrations, "SCHEMA_VERSION", 5):
             directory = initialize_campaign(Path(self.temporary.name), "v5 团")
             member = add_member(directory, "旧角色")
-            scene = create_scene(directory, "旧场景", [member])
+            scene = seed_legacy_scene(directory, "旧场景", [member])
             message, _ = save_lobby_message(directory, "v5-message", "旧线索", token=None, channel_id=scene)
         state = local_channel_state(directory)
         self.assertEqual(state["members"][0]["channel_id"], scene)

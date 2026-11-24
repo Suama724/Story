@@ -26,6 +26,7 @@ from host.app import create_app
 from host.auth import AuthError, AuthService, DEFAULT_PASSWORD
 from host.management import add_member, edit_member, list_members
 from host.storage import DATABASE_NAME, campaign_info, create_member, initialize_campaign, open_campaign
+from tests.attribute_fixtures import add_ready_player
 
 NEW_PASSWORD = "新的密码 🎲 123456"
 
@@ -158,7 +159,7 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
         asyncio.get_running_loop().slow_callback_duration = 2
         self.temporary = tempfile.TemporaryDirectory()
         self.directory = initialize_campaign(Path(self.temporary.name), "联网测试")
-        add_member(self.directory, "调查员")
+        add_ready_player(self.directory, "调查员")
         self.password_events = []
         self.player_logs = []
         self.broadcasts = []
