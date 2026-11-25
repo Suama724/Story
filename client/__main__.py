@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 from client.lobby_window import LobbyWindow
 from client.player_window import PlayerWindow
 from client.role_window import RoleWindow
+from client.ui_style import apply_theme
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Story")
+    apply_theme(app)
     app.setFont(QFont("Microsoft YaHei UI", 10))
     if arguments.legacy:
         window = LobbyWindow()

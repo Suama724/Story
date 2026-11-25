@@ -4,9 +4,11 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
-from .player_window import STYLE, PlayerWindow
+from .player_window import PlayerWindow
+from .ui_style import STYLE
+from .window_title_bar import BAR_HEIGHT, window_layout
 
 
 class RoleWindow(QWidget):
@@ -14,12 +16,10 @@ class RoleWindow(QWidget):
         super().__init__()
         self.data_root = data_root
         self._window: QWidget | None = None
-        self.setObjectName("player")
-        self.setWindowTitle("Story · 选择身份")
-        self.resize(420, 176)
-        self.setMinimumSize(320, 160)
+        self.resize(420, 176 + BAR_HEIGHT)
+        self.setMinimumSize(320, 160 + BAR_HEIGHT)
         self.setStyleSheet(STYLE)
-        layout = QVBoxLayout(self)
+        self.title_bar, layout = window_layout(self, self, "选择身份")
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
         for title, opened in (

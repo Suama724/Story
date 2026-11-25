@@ -29,6 +29,7 @@ try {
         "--specpath", "build"
         "--workpath", "build/windows-client"
         "--distpath", "dist"
+        "--add-data", "$projectRoot/assets/icons/phosphor;assets/icons/phosphor"
         "client/__main__.py"
     )
     # Restrict dependency discovery to Windows and the project environment.

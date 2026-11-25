@@ -27,7 +27,8 @@ LOGIN_ERRORS = {
     "role_mismatch": "身份不匹配，请选择正确的 PL 或 OB。",
 }
 
-from .ui_style import STYLE
+from .ui_style import BACKGROUND, BORDER, FOCUS, HOVER, SELECTION, STYLE, SURFACE, TEXT
+from .window_title_bar import BAR_HEIGHT, window_layout
 
 
 def label(text: str = "", name: str = "") -> QLabel:
@@ -93,10 +94,11 @@ def add_identity_card(widget: QListWidget, record: dict) -> None:
     widget.addItem(item)
 
 
-IDENTITY_STYLE = """
-QListWidget { background: white; border: 1px solid #ccd6df; border-radius: 6px; padding: 6px; outline: none; }
-QListWidget::item { background: #f6f8fa; border: 1px solid #ccd6df; border-radius: 4px; padding: 8px; }
-QListWidget::item:selected { background: #e6eff7; border-color: #326b97; color: #203548; }
+IDENTITY_STYLE = f"""
+QListWidget {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 6px; padding: 6px; outline: none; }}
+QListWidget::item {{ background: {BACKGROUND}; border: 1px solid {BORDER}; border-radius: 4px; padding: 8px; }}
+QListWidget::item:hover {{ background: {HOVER}; }}
+QListWidget::item:selected {{ background: {SELECTION}; border-color: {FOCUS}; color: {TEXT}; }}
 """
 
 
@@ -151,10 +153,8 @@ class IdentityManagementDialog(QDialog):
 class PlayerWindow(QWidget):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.setObjectName("player")
-        self.setWindowTitle("参与者登录")
-        self.resize(760, 386)
-        self.setMinimumSize(680, 360)
+        self.resize(760, 386 + BAR_HEIGHT)
+        self.setMinimumSize(680, 360 + BAR_HEIGHT)
         self.setStyleSheet(STYLE)
         self.auth = AuthClient(self)
         self.auth.completed.connect(self._auth_completed)
@@ -179,7 +179,8 @@ class PlayerWindow(QWidget):
         self._login_minimum_size = self.minimumSize()
         self._login_was_maximized = False
 
-        layout = QVBoxLayout(self)
+        self.title_bar, self._content_layout = window_layout(self, self, "参与者登录")
+        layout = self._content_layout
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
         self.personal_info_dialog = PersonalInfoDialog(self)
@@ -491,7 +492,7 @@ class PlayerWindow(QWidget):
         key = self._lobby_identity()
         cache = self._history_cache(key) if key is not None else None
         self.lobby = LobbyWindow(session=self.session, address=self._websocket.toString(), cache=cache,
-                                 offline_actor=actor_name, campaign_name=campaign_name)
+                                 offline_actor=actor_name)
         self.lobby.loginRequested.connect(self._login_from_history)
         self.lobby.sessionRejected.connect(self._session_rejected)
         self.lobby.socket.stateChanged.connect(self._update_controls)
@@ -499,8 +500,8 @@ class PlayerWindow(QWidget):
             self.lobby.restore_drafts(self._drafts.pop(key, {}))
         self.lobby.personalInfoRequested.connect(self._open_personal_info)
         self.lobby.attributesStatusChanged.connect(self._attributes_status_changed)
-        self.layout().setContentsMargins(0, 0, 0, 0)
-        self.layout().setSpacing(0)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(0)
         self.pages.addWidget(self.lobby)
         self.pages.setCurrentWidget(self.lobby)
         self._show_lobby_identity(campaign_name, actor_name)
@@ -529,7 +530,7 @@ class PlayerWindow(QWidget):
                           max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1)))
 
     def _show_lobby_identity(self, campaign_name: str, actor_name: str) -> None:
-        self.setWindowTitle(f"Story · {actor_name}")
+        self.title_bar.set_caption(campaign_name, actor_name)
 
     def _leave_lobby(self) -> None:
         self._close_attribute_dialogs()
@@ -545,8 +546,8 @@ class PlayerWindow(QWidget):
             self.pages.removeWidget(self.lobby)
             self.lobby.deleteLater()
             self.lobby = None
-            self.layout().setContentsMargins(22, 20, 22, 18)
-            self.layout().setSpacing(12)
+            self._content_layout.setContentsMargins(22, 20, 22, 18)
+            self._content_layout.setSpacing(12)
             self.setMinimumSize(self._login_minimum_size)
             if self._login_geometry is not None:
                 self.layout().activate()
@@ -566,7 +567,7 @@ class PlayerWindow(QWidget):
         self._pending_password = ""
         self._load_history()
         self.pages.setCurrentIndex(0)
-        self.setWindowTitle("参与者登录")
+        self.title_bar.set_caption("参与者登录")
         self.feedback.setText(message)
         self._update_controls()
 

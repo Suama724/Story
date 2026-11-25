@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 
 from coc7_attributes import ATTRIBUTES, MAX_IMPORT_LENGTH, RESOURCES, SKILL_COLUMNS, skill_defaults
 
+from .ui_style import BACKGROUND, BORDER, DANGER, SELECTION, SIDEBAR, SURFACE, TEXT
 
 class AttributeImportDialog(QDialog):
     importRequested = Signal(str)
@@ -51,11 +52,6 @@ class AttributeImportDialog(QDialog):
         self.feedback.setText("正在导入…" if pending else feedback)
 
 
-_LIGHT = "#deeaf6"
-_BLUE = "#bed7ee"
-_INK = "#203548"
-
-
 def _table(rows: int, columns: int) -> QTableWidget:
     table = QTableWidget(rows, columns)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -64,15 +60,15 @@ def _table(rows: int, columns: int) -> QTableWidget:
     table.horizontalHeader().hide()
     table.verticalHeader().setDefaultSectionSize(26)
     table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-    table.setStyleSheet("QTableWidget { gridline-color: #a9bfd0; padding: 0; border-radius: 0; }")
+    table.setStyleSheet(f"QTableWidget {{ gridline-color: {BORDER}; padding: 0; border-radius: 0; }}")
     return table
 
 
-def _cell(table: QTableWidget, row: int, column: int, value, fill: str = "#ffffff") -> None:
+def _cell(table: QTableWidget, row: int, column: int, value, fill: str) -> None:
     item = QTableWidgetItem("—" if value is None else str(value))
     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
     item.setBackground(QColor(fill))
-    item.setForeground(QColor(_INK))
+    item.setForeground(QColor(TEXT))
     table.setItem(row, column, item)
 
 
@@ -91,18 +87,18 @@ class AttributeSheetDialog(QDialog):
             value = values.get(key)
             self.attributes_table.setSpan(row, column, 2, 1)
             self.attributes_table.setSpan(row, column + 1, 2, 1)
-            _cell(self.attributes_table, row, column, f"{label}\n{key.upper()}", _LIGHT)
-            _cell(self.attributes_table, row, column + 1, value, _BLUE)
+            _cell(self.attributes_table, row, column, f"{label}\n{key.upper()}", SIDEBAR)
+            _cell(self.attributes_table, row, column + 1, value, SELECTION)
             for offset, divisor, difficulty in ((0, 2, "困难"), (1, 5, "极难")):
                 _cell(self.attributes_table, row + offset, column + 2,
-                      None if value is None else f"{difficulty} {value // divisor}", _LIGHT)
+                      None if value is None else f"{difficulty} {value // divisor}", SIDEBAR)
         self.attributes_table.setFixedHeight(6 * 26 + 2)
         layout.addWidget(self.attributes_table)
 
         resources = _table(1, 6)
         for index, (key, label) in enumerate(RESOURCES):
-            _cell(resources, 0, 2 * index, label, _LIGHT)
-            _cell(resources, 0, 2 * index + 1, values[key], _BLUE)
+            _cell(resources, 0, 2 * index, label, SIDEBAR)
+            _cell(resources, 0, 2 * index + 1, values[key], SELECTION)
         resources.setFixedHeight(28)
         layout.addWidget(resources)
 
@@ -119,11 +115,11 @@ class AttributeSheetDialog(QDialog):
             for row, name in enumerate(names):
                 value = values[name]
                 for offset, item in enumerate((name, defaults.get(name), value, value // 2, value // 5)):
-                    _cell(self.skills_table, row, column + offset, item, "#ffffff" if row % 2 == 0 else _LIGHT)
+                    _cell(self.skills_table, row, column + offset, item, SURFACE if row % 2 == 0 else BACKGROUND)
                     if offset == 0:
                         self.skills_table.item(row, column).setToolTip(name)
         header = self.skills_table.horizontalHeader()
-        header.setStyleSheet(f"QHeaderView::section {{ background: {_BLUE}; color: {_INK}; padding: 4px; }}")
+        header.setStyleSheet(f"QHeaderView::section {{ background: {SELECTION}; color: {TEXT}; padding: 4px; }}")
         header.show()
         for column in (0, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
@@ -139,7 +135,7 @@ class AttributeSheetDialog(QDialog):
         buttons.addStretch()
         if organizer:
             self.reset_button = QPushButton("重置属性")
-            self.reset_button.setStyleSheet("color: #a33737;")
+            self.reset_button.setStyleSheet(f"color: {DANGER};")
             buttons.addWidget(self.reset_button)
         close = QPushButton("关闭")
         close.clicked.connect(self.accept)

@@ -14,6 +14,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from websockets.asyncio.client import connect
 
@@ -88,11 +89,15 @@ class HostGuiTests(unittest.TestCase):
         self.assertEqual(self.window.pages.currentIndex(), 0)
         self.assertFalse(self.window.server.active)
         campaign = self.create_from_form()
+        self.assertEqual(self.window.title_bar.caption.text(), campaign["name"])
+        self.assertEqual(self.window.title_bar.identity.text(), "KP")
+        sidebar = self.window.network_status.parentWidget().layout()
+        self.assertIs(sidebar.itemAt(0).widget(), self.window.network_status)
         self.assertEqual(campaign["kp_name"], "KP")
         self.assertEqual(campaign["description"], "团本简介\n第二行")
         self.assertEqual(len(campaign["members"]), 1)
         self.assertTrue(self.window.add_button.isEnabled())
-        self.assertFalse(self.window.send_button.isEnabled())
+        self.assertFalse(self.window.message_input.send_available)
         directory = campaign["directory"]
         player = add_member(directory, "调查员乙")
         edit_member(directory, player, "角色改名")
@@ -128,13 +133,13 @@ class HostGuiTests(unittest.TestCase):
         self.assertFalse(self.window.server.active)
         for count in (HISTORY_PAGE_SIZE, HISTORY_PAGE_SIZE * 2):
             self.assertEqual(self.window.messages.toPlainText().splitlines(), [
-                f"KP：历史 {sequence:03d}" for sequence in range(total - count + 1, total + 1)
+                line for sequence in range(total - count + 1, total + 1) for line in ("KP", f"历史 {sequence:03d}")
             ])
             self.assertTrue(self.window.messages.has_more)
             self.window.messages.request_older()
             self.wait_until(lambda: not self.window._busy)
         self.assertEqual(self.window.messages.toPlainText().splitlines(), [
-            f"KP：历史 {sequence:03d}" for sequence in range(1, total + 1)
+            line for sequence in range(1, total + 1) for line in ("KP", f"历史 {sequence:03d}")
         ])
         self.assertFalse(self.window.messages.has_more)
 
@@ -148,7 +153,8 @@ class HostGuiTests(unittest.TestCase):
         self.window.show()
         self.app.processEvents()
         selector_geometry = self.window.geometry()
-        self.assertTrue(self.window.masthead.isHidden())
+        self.assertEqual(self.window.title_bar.caption.text(), "组织者登录")
+        self.assertTrue(self.window.title_bar.separator.isHidden())
         campaign = self.create_from_form()
         self.assertGreater(self.window.height(), selector_geometry.height())
         add_member(campaign["directory"], "角色")
@@ -256,7 +262,7 @@ class HostGuiTests(unittest.TestCase):
                 self.assertEqual(received, second_ack["message"])
                 self.assertEqual(received["nickname"], "角色改名")
                 self.window.message_input.setPlainText("主持人调试消息")
-                self.window.send_button.click()
+                QTest.keyClick(self.window.message_input, Qt.Key.Key_Return)
                 self.app.processEvents()
                 received = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
                 self.assertEqual(received["nickname"], "KP")
@@ -308,7 +314,7 @@ class HostGuiTests(unittest.TestCase):
         self.window.open_button.click()
         self.wait_until(lambda: not self.window._busy)
         self.assertEqual(self.window.messages.toPlainText().splitlines(), [
-            "调查员甲：来自玩家 🎲", "角色改名：改名后发言", "KP：主持人调试消息",
+            "调查员甲", "来自玩家 🎲", "角色改名", "改名后发言", "KP", "主持人调试消息",
         ])
 
     def test_occupied_port_preserves_existing_listener(self) -> None:
@@ -377,7 +383,7 @@ class HostGuiTests(unittest.TestCase):
             self.wait_until(lambda: player.lobby is not None and player.lobby._channel_state_ready)
         a, b = (player.lobby for player in self.players)
         self.window.message_input.setPlainText("大厅欢迎")
-        self.window.send_button.click()
+        QTest.keyClick(self.window.message_input, Qt.Key.Key_Return)
         self.wait_until(lambda: "大厅欢迎" in a.chat_history.toPlainText() and "大厅欢迎" in b.chat_history.toPlainText()
                         and self.window.create_group_button.isEnabled())
         a.message.setPlainText("大厅草稿")
@@ -401,14 +407,14 @@ class HostGuiTests(unittest.TestCase):
         a.channel_choice.setCurrentIndex(a.channel_choice.findData(scene))
         self.assertNotIn("大厅欢迎", a.chat_history.toPlainText())
         self.window.message_input.setPlainText("地下室线索 🎲")
-        self.window.send_button.click()
+        QTest.keyClick(self.window.message_input, Qt.Key.Key_Return)
         self.wait_until(lambda: "地下室线索 🎲" in a.chat_history.toPlainText())
         self.assertNotIn("地下室线索", b.chat_history.toPlainText())
         a.message.setPlainText("地下室草稿")
         a.channel_choice.setCurrentIndex(a.channel_choice.findData(lobby))
         self.assertEqual(a.message.toPlainText(), "大厅草稿")
         self.assertNotIn("地下室线索", a.chat_history.toPlainText())
-        self.assertTrue(a.send_button.isEnabled())
+        self.assertTrue(a.message.send_available)
         a.channel_choice.setCurrentIndex(a.channel_choice.findData(scene))
         self.assertEqual(a.message.toPlainText(), "地下室草稿")
 
@@ -423,9 +429,9 @@ class HostGuiTests(unittest.TestCase):
         self.assertEqual(b.message.toPlainText(), "B 的草稿")
         b.channel_choice.setCurrentIndex(b.channel_choice.findData(scene))
         self.wait_until(lambda: "地下室线索 🎲" in b.chat_history.toPlainText())
-        self.assertFalse(b.send_button.isEnabled())
+        self.assertFalse(b.message.send_available)
         self.window.message_input.setPlainText("旁观可见的新线索")
-        self.window.send_button.click()
+        QTest.keyClick(self.window.message_input, Qt.Key.Key_Return)
         self.wait_until(lambda: "旁观可见的新线索" in b.chat_history.toPlainText() and self.window.create_group_button.isEnabled())
         b.socket.sendTextMessage(json.dumps({"type": "chat.send", "channel_id": scene, "text": "旁观者越权", "request_id": "forged-send"}))
         self.wait_until(lambda: any(item.get("request_id") == "forged-send" for item in replies))
@@ -444,7 +450,7 @@ class HostGuiTests(unittest.TestCase):
         self.assertEqual(a.message.toPlainText(), "大厅草稿")
         a.channel_choice.setCurrentIndex(a.channel_choice.findData(scene))
         self.wait_until(lambda: "地下室线索 🎲" in a.chat_history.toPlainText())
-        self.assertFalse(a.send_button.isEnabled())
+        self.assertFalse(a.message.send_available)
         self.assertEqual(a.message.toPlainText(), "地下室草稿")
 
     def test_opening_channel_then_immediately_switching_campaign_flushes_read_position(self) -> None:

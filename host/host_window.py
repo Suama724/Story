@@ -19,9 +19,17 @@ from PySide6.QtWidgets import (
 
 from chat_protocol import chat_text_error
 from client.attribute_dialogs import AttributeSheetDialog
+from client.channel_header import ChannelHeader
+from client.chat_composer import ChatComposer
 from client.chat_history import ChatHistory
 from client.channel_tree import ChannelTree
 from client.player_window import identity_list
+from client.ui_style import (
+    BACKGROUND, BORDER, BUTTON_STYLE, CHANNEL_NAV_STYLE, DANGER, FOCUS, MUTED, SELECTION, SIDEBAR, SURFACE, TEXT,
+    apply_theme,
+)
+from client.ui_widgets import ElidedButton, split_channel_view
+from client.window_title_bar import BAR_HEIGHT, window_layout
 
 from .management import add_member, campaign_details, edit_member
 from .attributes import local_attributes, reset_local_attributes
@@ -36,39 +44,23 @@ from .lobby_dialogs import (
     ChannelHistoryDialog, ChannelManagementDialog, ChannelMembersDialog,
 )
 
-STYLE = """
-QMainWindow, QDialog { background: #e9eef3; color: #203548; }
-QWidget { font-size: 14px; }
-QFrame#masthead { background: #203548; border-radius: 6px; }
-QLabel#brand { color: white; font: 600 24px 'Bahnschrift'; }
-QLabel#mastCaption { color: #c2d3e0; }
-QFrame#panel { background: white; border: 1px solid #ccd6df; border-radius: 6px; }
-QLabel#heading { font-size: 20px; font-weight: 600; }
-QLabel#muted { color: #687b8d; }
-QPushButton { background: #f6f8fa; border: 1px solid #bbcbd8; border-radius: 4px; padding: 7px 12px; }
-QPushButton:hover { background: #e6eff7; border-color: #326b97; }
-QPushButton:focus { border: 2px solid #326b97; }
-QPushButton#primary { background: #326b97; color: white; border-color: #326b97; }
-QPushButton#primary:hover { background: #25577e; }
-QPushButton:disabled, QPushButton#primary:disabled { background: #edf1f5; color: #95a3af; border-color: #d5dee6; }
-QLineEdit, QSpinBox, QPlainTextEdit, QComboBox, QListWidget, QTableWidget {
-    background: white; color: #203548; border: 1px solid #ccd6df;
-    border-radius: 4px; padding: 5px; selection-background-color: #d5e8f8;
-    selection-color: #203548;
-}
-QLineEdit:focus, QPlainTextEdit:focus { border: 1px solid #326b97; }
-QHeaderView::section { background: #f1f5f8; color: #687b8d; padding: 7px; border: none; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { padding: 9px 18px; background: #e9eef3; color: #687b8d; }
-QTabBar::tab:selected { background: white; color: #203548; border-top: 2px solid #326b97; }
-QWidget#lobbyPage { background: white; }
-QFrame#lobbySidebar { background: #e9eef3; border-right: 1px solid #ccd6df; }
-QFrame#channelHeader { background: white; border-bottom: 1px solid #ccd6df; }
-QTreeWidget#channelTree { background: transparent; border: none; outline: none; }
-QTreeWidget#channelTree::item { padding: 4px 2px; border-radius: 4px; }
-QTreeWidget#channelTree::item:selected { background: #d5e8f8; color: #203548; }
-QPushButton#groupAdd { border: none; background: transparent; padding: 0; color: #326b97; font-size: 20px; }
-QPushButton#groupAdd:hover { background: #d5e8f8; }
+STYLE = BUTTON_STYLE + CHANNEL_NAV_STYLE + f"""
+QMainWindow, QDialog {{ color: {TEXT}; }}
+QDialog {{ background: {BACKGROUND}; }}
+QWidget {{ font-size: 14px; }}
+QFrame#panel {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 6px; }}
+QLabel#muted {{ color: {MUTED}; }}
+QPushButton {{ padding: 7px 12px; }}
+QLineEdit, QSpinBox, QPlainTextEdit, QTextEdit, QComboBox, QListWidget, QTableWidget {{
+    background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER}; border-radius: 4px;
+    padding: 5px; selection-background-color: {SELECTION}; selection-color: {TEXT};
+}}
+QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus {{ border-color: {FOCUS}; }}
+QHeaderView::section {{ background: {SIDEBAR}; color: {MUTED}; padding: 7px; border: none; }}
+QTabWidget::pane {{ border: none; }}
+QTabBar::tab {{ padding: 9px 18px; background: {BACKGROUND}; color: {MUTED}; }}
+QTabBar::tab:selected {{ background: {SURFACE}; color: {TEXT}; border-top: 2px solid {FOCUS}; }}
+QWidget#lobbyPage {{ background: {SURFACE}; }}
 """
 
 
@@ -238,9 +230,8 @@ class HostWindow(QMainWindow):
 
     def __init__(self, data_root: Path) -> None:
         super().__init__()
-        self.setWindowTitle("组织者登录")
-        self.resize(760, 400)
-        self.setMinimumSize(680, 360)
+        self.resize(760, 400 + BAR_HEIGHT)
+        self.setMinimumSize(680, 360 + BAR_HEIGHT)
         self.setStyleSheet(STYLE)
         self.data_root = data_root.resolve()
         self.library = CampaignLibrary(self.data_root)
@@ -286,21 +277,10 @@ class HostWindow(QMainWindow):
         self.server.sendFailed.connect(self._channel_command_failed)
 
         central = QWidget()
-        layout = QVBoxLayout(central)
+        self.title_bar, self._content_layout = window_layout(self, central, "组织者登录")
+        layout = self._content_layout
         layout.setContentsMargins(20, 18, 20, 14)
         layout.setSpacing(16)
-        masthead = QFrame()
-        self.masthead = masthead
-        masthead.setObjectName("masthead")
-        bar = QHBoxLayout(masthead)
-        bar.setContentsMargins(20, 13, 20, 13)
-        bar.addWidget(label("STORY", "brand"))
-        bar.addWidget(label("主机工作台", "mastCaption"))
-        bar.addStretch()
-        self.header_state = label("选择一个团开始", "mastCaption")
-        bar.addWidget(self.header_state)
-        layout.addWidget(masthead)
-        masthead.hide()
         self.pages = CurrentPageStack()
         self.pages.addWidget(self._build_selector())
         self.pages.addWidget(self._build_lobby())
@@ -369,13 +349,10 @@ class HostWindow(QMainWindow):
         columns.setSpacing(0)
         sidebar = QFrame()
         sidebar.setObjectName("lobbySidebar")
-        sidebar.setFixedWidth(240)
         left = QVBoxLayout(sidebar)
         left.setContentsMargins(16, 16, 16, 16)
         left.setSpacing(12)
-        self.campaign_title = label("", "heading")
-        left.addWidget(self.campaign_title)
-        self.network_status = QPushButton("连接状态 · 关闭")
+        self.network_status = ElidedButton("连接状态 · 关闭")
         self.network_status.clicked.connect(self._open_connection)
         left.addWidget(self.network_status)
         left.addSpacing(16)
@@ -399,52 +376,35 @@ class HostWindow(QMainWindow):
         self.network_button.setObjectName("primary")
         self.network_button.clicked.connect(self._toggle_network)
         left.addWidget(self.network_button)
-        columns.addWidget(sidebar)
-
-        right = QVBoxLayout()
+        chat_panel = QWidget()
+        right = QVBoxLayout(chat_panel)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
-        header = QFrame()
-        header.setObjectName("channelHeader")
-        header.setFixedHeight(104)
-        top = QHBoxLayout(header)
-        top.setContentsMargins(24, 16, 24, 16)
-        top.setSpacing(16)
-        self.channel_title = label("", "heading")
-        self.channel_title.setFixedWidth(220)
-        top.addWidget(self.channel_title)
-        self.channel_info_button = QPushButton("频道简介")
+        self.channel_header = ChannelHeader(can_archive=True)
+        self.channel_title = self.channel_header.title
+        self.channel_info_button = self.channel_header.description_button
         self.channel_info_button.clicked.connect(self._open_channel_info)
-        self.channel_members_button = QPushButton("频道成员")
+        self.channel_members_button = self.channel_header.members_button
         self.channel_members_button.clicked.connect(self._open_channel_members)
-        self.channel_log_button = QPushButton("log")
-        self.channel_log_button.setToolTip("查看当前频道完整聊天记录")
+        self.channel_log_button = self.channel_header.history_button
         self.channel_log_button.clicked.connect(self._open_channel_history)
-        for button in (self.channel_info_button, self.channel_members_button, self.channel_log_button):
-            top.addWidget(button)
-        self.archive_scene_button = QPushButton("结束频道")
+        self.archive_scene_button = self.channel_header.archive_button
         self.archive_scene_button.clicked.connect(self._archive_scene)
-        top.addStretch()
-        top.addWidget(self.archive_scene_button)
-        right.addWidget(header)
-        chat = QVBoxLayout()
-        chat.setContentsMargins(20, 16, 20, 16)
-        chat.setSpacing(10)
-        self.messages = ChatHistory()
+        right.addWidget(self.channel_header)
+        self.messages = ChatHistory(conversation=True)
         self.messages.olderRequested.connect(self._load_older_history)
         self.messages.setPlaceholderText("暂无消息")
         self.server.messageReceived.connect(self._receive_message)
-        chat.addWidget(self.messages, 1)
-        self.message_input = QPlainTextEdit()
+        right.addWidget(self.messages, 1)
+        self.message_input = ChatComposer()
         self.message_input.setPlaceholderText("以 KP 身份发言")
-        self.message_input.setFixedHeight(76)
-        chat.addWidget(self.message_input)
-        self.send_button = QPushButton("发送")
-        self.send_button.setObjectName("primary")
-        self.send_button.clicked.connect(self._send_message)
-        chat.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignRight)
-        right.addLayout(chat, 1)
-        columns.addLayout(right, 1)
+        self.message_input.sendRequested.connect(self._send_message)
+        composer = QVBoxLayout()
+        composer.setContentsMargins(12, 2, 12, 12)
+        composer.addWidget(self.message_input)
+        right.addLayout(composer)
+        self.channel_splitter = split_channel_view(sidebar, chat_panel)
+        columns.addWidget(self.channel_splitter)
 
         self.connection_dialog = ConnectionDialog(self)
         self.listen_host = self.connection_dialog.listen_host
@@ -475,7 +435,7 @@ class HostWindow(QMainWindow):
         self._busy = True
         self._on_result = on_result
         self.feedback.setText("正在处理…")
-        self.feedback.setStyleSheet("color: #687b8d;")
+        self.feedback.setStyleSheet(f"color: {MUTED};")
         self._update_buttons()
         worker = OperationThread(operation, self)
         self._job = worker
@@ -508,7 +468,7 @@ class HostWindow(QMainWindow):
 
     def _report_error(self, message: str) -> None:
         self.feedback.setText(message)
-        self.feedback.setStyleSheet("color: #a33737;")
+        self.feedback.setStyleSheet(f"color: {DANGER};")
         self._append_log(message)
 
     def _append_log(self, message: str) -> None:
@@ -711,9 +671,6 @@ class HostWindow(QMainWindow):
         self.campaign = campaign
         self._queued_channel_state = None
         self._channel_revision = 0
-        self.campaign_title.setText(str(campaign["name"]))
-        self.campaign_title.setToolTip(str(campaign["directory"]))
-        self.header_state.setText("本地管理 · 监听已关闭")
         self.messages.clear()
         self._pending_reads.clear()
         self._channel_refresh_timer.stop()
@@ -724,9 +681,8 @@ class HostWindow(QMainWindow):
         self._retry_send = None
         self.message_input.clear()
         self.pages.setCurrentIndex(1)
-        self.masthead.hide()
-        self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
-        self.setWindowTitle("Story · 主机工作台")
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_bar.set_caption(str(campaign["name"]), "KP")
         self._populate_members()
         self._update_channel_windows()
         self.centralWidget().layout().activate()
@@ -1050,11 +1006,9 @@ class HostWindow(QMainWindow):
             self.server.start(self.campaign["directory"], host, self.listen_port.value())
 
     def _network_state(self, state: str) -> None:
-        captions = {"stopped": "监听已关闭", "starting": "正在启动…", "running": "正在监听", "stopping": "正在停止…"}
         states = {"stopped": "关闭", "starting": "开启中…", "running": "开启", "stopping": "关闭中…"}
         self.network_status.setText(f"连接状态 · {states[state]}")
         self.connection_dialog.status.setText(f"连接状态：{states[state]}")
-        self.header_state.setText(f"本地管理 · {captions[state]}")
         self.network_button.setText("开启监听" if state == "stopped" else "关闭监听")
         if state == "running":
             self.server.command("channels")
@@ -1075,7 +1029,7 @@ class HostWindow(QMainWindow):
         self._update_buttons()
 
     def _send_message(self) -> None:
-        if self._pending_send is not None or self.server.state != "running":
+        if not self.message_input.send_available:
             return
         text = self.message_input.toPlainText()
         if chat_text_error(text) is not None:
@@ -1140,9 +1094,8 @@ class HostWindow(QMainWindow):
         self._pending_reads.clear()
         self._channel_refresh_timer.stop()
         self.pages.setCurrentIndex(0)
-        self.masthead.hide()
-        self.setWindowTitle("组织者登录")
-        self.setMinimumSize(680, 360)
+        self.title_bar.set_caption("组织者登录")
+        self.setMinimumSize(680, 360 + BAR_HEIGHT)
         self.centralWidget().layout().activate()
         if self._selector_geometry is not None:
             if self._selector_was_maximized:
@@ -1151,8 +1104,7 @@ class HostWindow(QMainWindow):
                 self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMaximized)
                 self.setGeometry(self._selector_geometry)
             self._selector_geometry = None
-        self.header_state.setText("选择一个团开始")
-        self.centralWidget().layout().setContentsMargins(20, 18, 20, 14)
+        self._content_layout.setContentsMargins(20, 18, 20, 14)
         self.refresh_campaigns()
 
     def _update_buttons(self, *args: object) -> None:
@@ -1177,16 +1129,14 @@ class HostWindow(QMainWindow):
         self.create_group_button.setEnabled(scene_available)
         self.channel_management_button.setEnabled(scene_available)
         self.channel_management_dialog.save.setEnabled(scene_available and self.channel_management_dialog.selected_id() is not None)
-        self.channel_title.setText(channel.get("name", ""))
-        self.channel_title.setToolTip(channel.get("name", ""))
+        self.channel_header.set_channel(channel.get("name", ""), channel.get("description", ""))
         for button in (self.channel_info_button, self.channel_members_button, self.channel_log_button):
             button.setEnabled(scene_available and bool(channel))
         self.archive_scene_button.setEnabled(scene_available and channel.get("kind") == "scene" and channel.get("status") == "active")
         can_send = channel.get("can_send", False)
-        self.send_button.setText("发送")
         self.message_input.setPlaceholderText("频道已归档" if channel.get("status") == "archived" else f"以 KP 身份发送到 {channel.get('name', '')}")
         self.message_input.setReadOnly(self._pending_send is not None or not can_send)
-        self.send_button.setEnabled(available and self.server.state == "running" and self._pending_send is None and can_send)
+        self.message_input.send_available = available and self.server.state == "running" and self._pending_send is None and can_send
         self.messages.set_pagination(self._history_has_more, loading=not available)
         for dialog in self._history_dialogs.values():
             dialog.history.set_pagination(dialog.has_more, loading=not available)
@@ -1217,6 +1167,7 @@ class HostWindow(QMainWindow):
 def run_gui(data_root: Path) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Story Host")
+    apply_theme(app)
     app.setFont(QFont("Microsoft YaHei UI", 10))
     window = HostWindow(data_root)
     window.show()

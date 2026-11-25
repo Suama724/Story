@@ -38,22 +38,18 @@ from chat_protocol import (
 )
 
 from .auth_client import AuthClient, ClientSession, server_urls
+from .channel_header import ChannelHeader
+from .chat_composer import ChatComposer
 from .chat_history import ChatHistory
 from .history_cache import HistoryCache, is_saved_message
 from .channel_tree import ChannelTree
-from .ui_style import STYLE
+from .ui_style import CHANNEL_NAV_STYLE, STYLE, SURFACE
+from .ui_widgets import ElidedLabel, split_channel_view
 from .host_monitor import HostMonitor
 from .lobby_dialogs import ChannelLogDialog, ChannelMembersDialog
 
-LOBBY_STYLE = """
-QWidget#participantLobby { background: white; color: #203548; font-size: 14px; }
-QFrame#participantSidebar { background: #e9eef3; border-right: 1px solid #ccd6df; }
-QFrame#participantHeader { background: white; border-bottom: 1px solid #ccd6df; }
-QLabel#heading { font-size: 20px; font-weight: 600; }
-QLabel#muted { color: #687b8d; }
-QTreeWidget#channelTree { background: transparent; border: none; outline: none; }
-QTreeWidget#channelTree::item { padding: 4px 2px; border-radius: 4px; }
-QTreeWidget#channelTree::item:selected { background: #d5e8f8; color: #203548; }
+LOBBY_STYLE = CHANNEL_NAV_STYLE + f"""
+QWidget#participantLobby {{ background: {SURFACE}; }}
 """
 
 
@@ -91,13 +87,14 @@ class LobbyWindow(QWidget):
     attributesStatusChanged = Signal()
 
     def __init__(self, *, session: ClientSession | None = None, address: str = DEFAULT_ADDRESS,
-                 cache: HistoryCache | None = None, offline_actor: str = "", campaign_name: str = "") -> None:
+                 cache: HistoryCache | None = None, offline_actor: str = "") -> None:
         super().__init__()
         self.session = session
         self._managed = session is not None or bool(offline_actor)
         self._cache = cache
         self._base_cache = cache
         self._channels: dict[str, dict] = {}
+        self._unread_channels: set[str] = set()
         self._channel_id = ""
         self._history_has_more = False
         self._host_open = True if session is not None else None
@@ -106,7 +103,6 @@ class LobbyWindow(QWidget):
         self._members_dialogs = {}
         self._info_dialogs = {}
         self._log_requests = {}
-        self._campaign_name = session.campaign_name if session is not None else campaign_name
         self._assigned_channel_id = ""
         self._channel_drafts: dict[str, tuple[str, tuple[str, str] | None]] = {}
         self._channel_state_ready = False
@@ -152,7 +148,7 @@ class LobbyWindow(QWidget):
         else:
             self.connect_button = QPushButton("连接")
             self.disconnect_button = QPushButton("断开")
-        self.connection_status = QLabel()
+        self.connection_status = ElidedLabel() if self._managed else QLabel()
         self.channel_choice = ChannelTree(managed=False) if self._managed else QComboBox()
         if not self._managed:
             self.channel_choice.hide()
@@ -160,14 +156,15 @@ class LobbyWindow(QWidget):
         self.feedback = FeedbackLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
         self.feedback.setWordWrap(True)
-        self.chat_history = ChatHistory()
+        self.chat_history = ChatHistory(conversation=self._managed)
         self.chat_history.setPlaceholderText("暂无可查看的消息")
         self.chat_history.olderRequested.connect(self._load_older)
-        self.message = QPlainTextEdit()
+        self.message = ChatComposer() if self._managed else QPlainTextEdit()
         self.message.setPlaceholderText("输入消息")
-        self.message.setFixedHeight(80)
-        self.send_button = QPushButton("发送")
-        self.send_button.setObjectName("primary")
+        if not self._managed:
+            self.message.setFixedHeight(80)
+            self.send_button = QPushButton("发送")
+            self.send_button.setObjectName("primary")
         self._awaiting_send = False
         self.retry_send: tuple[str, str] | None = None
         if self._managed:
@@ -205,6 +202,7 @@ class LobbyWindow(QWidget):
 
     def _build_layout(self) -> None:
         if not self._managed:
+            self.setStyleSheet(STYLE)
             connection_row = QHBoxLayout()
             for field in (self.address, self.nickname, self.connect_button, self.disconnect_button):
                 connection_row.addWidget(field)
@@ -230,15 +228,9 @@ class LobbyWindow(QWidget):
         columns.setSpacing(0)
         sidebar = QFrame()
         sidebar.setObjectName("participantSidebar")
-        sidebar.setFixedWidth(240)
         left = QVBoxLayout(sidebar)
         left.setContentsMargins(16, 16, 16, 16)
         left.setSpacing(12)
-        self.campaign_title = QLabel(self._campaign_name)
-        self.campaign_title.setTextFormat(Qt.TextFormat.PlainText)
-        self.campaign_title.setObjectName("heading")
-        self.campaign_title.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        left.addWidget(self.campaign_title)
         left.addWidget(self.connection_status)
         left.addSpacing(16)
         left.addWidget(self.channel_choice, 1)
@@ -246,51 +238,39 @@ class LobbyWindow(QWidget):
         self.personal_info_button.clicked.connect(lambda _checked=False: self.personalInfoRequested.emit())
         left.addWidget(self.personal_info_button)
         left.addWidget(self.connection_button)
-        columns.addWidget(sidebar)
-        right = QVBoxLayout()
+        chat_panel = QWidget()
+        right = QVBoxLayout(chat_panel)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
-        header = QFrame()
-        header.setObjectName("participantHeader")
-        header.setFixedHeight(104)
-        top = QHBoxLayout(header)
-        top.setContentsMargins(24, 16, 24, 16)
-        top.setSpacing(16)
-        self.history_label = QLabel()
-        self.history_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.history_label.setObjectName("heading")
-        self.history_label.setFixedWidth(220)
-        top.addWidget(self.history_label)
-        self.channel_info_button = QPushButton("频道简介")
+        self.channel_header = ChannelHeader()
+        self.channel_info_button = self.channel_header.description_button
         self.channel_info_button.clicked.connect(self._open_channel_info)
-        self.channel_members_button = QPushButton("频道成员")
+        self.channel_members_button = self.channel_header.members_button
         self.channel_members_button.clicked.connect(self._open_channel_members)
-        self.channel_log_button = QPushButton("log")
+        self.channel_log_button = self.channel_header.history_button
         self.channel_log_button.clicked.connect(self._open_channel_log)
-        for button in (self.channel_info_button, self.channel_members_button, self.channel_log_button):
-            top.addWidget(button)
-        top.addStretch()
-        right.addWidget(header)
-        chat = QVBoxLayout()
-        chat.setContentsMargins(20, 16, 20, 16)
-        chat.setSpacing(10)
-        chat.addWidget(self.chat_history, 1)
-        chat.addWidget(self.message)
-        chat.addWidget(self.send_button, alignment=Qt.AlignmentFlag.AlignRight)
+        right.addWidget(self.channel_header)
+        right.addWidget(self.chat_history, 1)
+        composer = QVBoxLayout()
+        composer.setContentsMargins(12, 2, 12, 12)
+        composer.setSpacing(6)
         self.feedback.hide()
-        chat.addWidget(self.feedback)
-        right.addLayout(chat, 1)
-        columns.addLayout(right, 1)
+        composer.addWidget(self.feedback)
+        composer.addWidget(self.message)
+        right.addLayout(composer)
+        self.channel_splitter = split_channel_view(sidebar, chat_panel)
+        columns.addWidget(self.channel_splitter)
 
     def _connect_signals(self) -> None:
         if self._managed:
             self.connection_button.clicked.connect(self._toggle_connection)
+            self.message.sendRequested.connect(self._send_message)
         else:
             self.connect_button.clicked.connect(self._open_connection)
             self.disconnect_button.clicked.connect(self._close_connection)
+            self.send_button.clicked.connect(self._send_message)
         self.address.returnPressed.connect(self._open_connection)
         self.nickname.returnPressed.connect(self._open_connection)
-        self.send_button.clicked.connect(self._send_message)
         self.socket.stateChanged.connect(self._update_connection_state)
         self.socket.connected.connect(self._connected)
         self.socket.textMessageReceived.connect(self._show_message)
@@ -561,9 +541,10 @@ class LobbyWindow(QWidget):
     def _update_send_controls(self) -> None:
         connected = self.socket.state() == SocketState.ConnectedState
         can_send = not self._managed or (self._channel_state_ready and self._channels.get(self._channel_id, {}).get("can_send") is True)
-        self.send_button.setEnabled(connected and can_send and not self._awaiting_send)
+        send_available = connected and can_send and not self._awaiting_send
         self.message.setReadOnly(self._awaiting_send or (self._managed and (not connected or not can_send)))
         if self._managed:
+            self.message.send_available = send_available
             channel = self._channels.get(self._channel_id, {})
             if not connected:
                 placeholder = "未连接"
@@ -572,6 +553,8 @@ class LobbyWindow(QWidget):
             else:
                 placeholder = f"发送到 {channel.get('name', '')}" if can_send else "频道只读"
             self.message.setPlaceholderText(placeholder)
+        else:
+            self.send_button.setEnabled(send_available)
         self.chat_history.set_pagination(self._history_has_more, self._history_request is not None)
 
     def _connected(self) -> None:
@@ -646,13 +629,19 @@ class LobbyWindow(QWidget):
             except (OSError, sqlite3.Error, ValueError):
                 self.feedback.setText("本地频道信息保存失败。")
         self._channels = available
+        self._unread_channels.intersection_update(available)
+        self._unread_channels.discard(selected)
         self._assigned_channel_id = assigned
         lobby_id = next((item["channel_id"] for item in channels if item["kind"] == "lobby"), "")
         if "" in self._channel_drafts:
             self._channel_drafts[lobby_id] = self._channel_drafts.pop("")
         self.channel_choice.blockSignals(True)
         groups = state.get("groups") or [{"group_id": "default", "name": "频道"}]
-        nav_channels = [dict(item, group_id=item.get("group_id") or groups[0]["group_id"]) for item in available.values()]
+        nav_channels = [
+            dict(item, group_id=item.get("group_id") or groups[0]["group_id"],
+                 unread_count=channel_id in self._unread_channels)
+            for channel_id, item in available.items()
+        ]
         self.channel_choice.set_channels(groups, nav_channels, selected)
         self.channel_choice.blockSignals(False)
         self._channel_id = selected
@@ -690,7 +679,7 @@ class LobbyWindow(QWidget):
     def _update_channel_status(self) -> None:
         channel = self._channels.get(self._channel_id)
         if channel is not None:
-            self.history_label.setText(channel["name"])
+            self.channel_header.set_channel(channel["name"], channel.get("description", ""))
         self._update_send_controls()
 
     def _select_channel(self, _index: int) -> None:
@@ -703,6 +692,8 @@ class LobbyWindow(QWidget):
         self._channel_id = selected
         self._set_channel_cache()
         self.chat_history.clear()
+        self._unread_channels.discard(selected)
+        self.channel_choice.set_unread(selected, False)
         if self._cache is not None:
             self._show_cached_page()
         self._restore_draft()
@@ -833,7 +824,12 @@ class LobbyWindow(QWidget):
             else:
                 dialog.pending_live.append(message)
         if self._managed and channel_id != self._channel_id:
-            if channel_id in self._channels and self._base_cache is not None and is_saved_message(message):
+            if channel_id not in self._channels or not is_saved_message(message):
+                return
+            if self.session is not None and message.get("member_id") != self.session.member_id:
+                self._unread_channels.add(channel_id)
+                self.channel_choice.set_unread(channel_id, True)
+            if self._base_cache is not None:
                 try:
                     cache = self._base_cache.for_channel(channel_id, lobby=self._channels[channel_id]["kind"] == "lobby")
                     cache.save([message])
@@ -859,7 +855,8 @@ class LobbyWindow(QWidget):
 
     @Slot()
     def _send_message(self) -> None:
-        if not self.send_button.isEnabled():
+        available = self.message.send_available if self._managed else self.send_button.isEnabled()
+        if not available:
             return
 
         text = self.message.toPlainText()

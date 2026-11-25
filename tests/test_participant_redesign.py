@@ -9,10 +9,13 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtCore import QPoint, QSettings, QTimer, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
+from client.chat_composer import ChatComposer
 from client.chat_history import ChatHistory
+from client.lobby_window import LobbyWindow
 from client.player_window import PasswordDialog, PlayerWindow
 from host.channels import create_channel_group, create_scene
 from host.management import add_member
@@ -32,8 +35,27 @@ class ScrollHistoryTests(unittest.TestCase):
         return [{"sequence": n, "message_id": str(n), "nickname": "KP", "text": f"记录 {n:05d}"}
                 for n in range(start, stop)]
 
+    def test_conversation_ignores_outer_blank_lines_but_preserves_body_spacing(self):
+        view = ChatHistory(conversation=True)
+        view.resize(500, 300)
+        view.show()
+        records = self.records(1, 4)
+        records[0]["text"] = "Normal line"
+        records[1]["text"] = "\r\n \t\r\nNormal line\r\n \t\r\n"
+        records[2]["text"] = "  First line\n\nSecond line  \u2028 \u2029"
+        view.add_messages(records)
+        self.app.processEvents()
+
+        self.assertEqual(view.toPlainText(), "KP\nNormal line\nKP\nNormal line\nKP\n  First line\n\nSecond line  ")
+        document = view.document()
+        layout = document.documentLayout()
+        first, second, third = [layout.blockBoundingRect(document.findBlockByNumber(i)) for i in range(3)]
+        self.assertEqual(first.height(), second.height())
+        self.assertEqual(second.top() - first.bottom(), third.top() - second.bottom())
+        view.close()
+
     def test_prepend_preserves_reading_anchor_and_live_append_does_not_jump(self):
-        view = ChatHistory()
+        view = ChatHistory(conversation=True)
         view.resize(600, 320)
         view.show()
         view.add_messages(self.records(5001, 5101))
@@ -77,6 +99,75 @@ class ScrollHistoryTests(unittest.TestCase):
         view.request_older()
         self.assertEqual(requests, [51])
         view.close()
+
+
+class ChannelNavigationTests(unittest.TestCase):
+    def test_dragging_resizes_both_panes_and_channel_group_still_expands(self):
+        app = QApplication.instance() or QApplication([])
+        lobby = LobbyWindow(offline_actor="调查员")
+        self.addCleanup(lobby.close)
+        lobby.resize(820, 550)
+        lobby.show()
+        tree = lobby.channel_choice
+        tree.set_channels(
+            [{"group_id": "g", "name": "调查现场"}],
+            [{"group_id": "g", "channel_id": "c", "name": "码头", "status": "active", "unread_count": 3}],
+            None,
+        )
+        app.processEvents()
+        group = tree.topLevelItem(0)
+        channel = group.child(0)
+        self.assertEqual(channel.text(0), "码头")
+        self.assertEqual(channel.data(0, Qt.ItemDataRole.AccessibleDescriptionRole), "有未读消息")
+        group_center = tree.visualItemRect(group).center()
+        QTest.mouseClick(tree.viewport(), Qt.MouseButton.LeftButton, pos=group_center)
+        self.assertFalse(group.isExpanded())
+        QTest.mouseClick(tree.viewport(), Qt.MouseButton.LeftButton, pos=group_center)
+        self.assertTrue(group.isExpanded())
+
+        splitter = lobby.channel_splitter
+        sidebar_width, chat_width = splitter.sizes()
+        handle = splitter.handle(1)
+        center = handle.rect().center()
+        QTest.mousePress(handle, Qt.MouseButton.LeftButton, pos=center)
+        QTest.mouseMove(handle, center - QPoint(72, 0))
+        QTest.mouseRelease(handle, Qt.MouseButton.LeftButton, pos=handle.rect().center())
+        app.processEvents()
+        self.assertLess(splitter.sizes()[0], sidebar_width)
+        self.assertGreater(splitter.sizes()[1], chat_width)
+        self.assertEqual(lobby.chat_history.width(), splitter.sizes()[1])
+
+
+class ComposerTests(unittest.TestCase):
+    def test_shift_return_grows_upward_and_return_sends_the_whole_draft(self):
+        app = QApplication.instance() or QApplication([])
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        history = ChatHistory(conversation=True)
+        composer = ChatComposer()
+        layout.addWidget(history, 1)
+        layout.addWidget(composer)
+        pane.resize(460, 320)
+        pane.show()
+        app.processEvents()
+        first_height, bottom = composer.height(), composer.geometry().bottom()
+        sent = []
+        composer.sendRequested.connect(lambda: sent.append(composer.toPlainText()))
+        composer.send_available = True
+        QTest.keyClick(composer, Qt.Key.Key_Return)
+        QTest.keyClicks(composer, "First line")
+        QTest.keyClick(composer, Qt.Key.Key_Return, Qt.KeyboardModifier.ShiftModifier)
+        QTest.keyClicks(composer, "Second line")
+        app.processEvents()
+        self.assertEqual(sent, [])
+        self.assertEqual(composer.geometry().bottom(), bottom)
+        self.assertEqual(composer.height(), first_height + composer.fontMetrics().lineSpacing())
+        QTest.keyClick(composer, Qt.Key.Key_Enter)
+        self.assertEqual(sent, ["First line\nSecond line"])
+        composer.clear()
+        app.processEvents()
+        self.assertEqual(composer.height(), first_height)
+        pane.close()
 
 
 class ParticipantUiTests(unittest.TestCase):
@@ -148,10 +239,21 @@ class ParticipantUiTests(unittest.TestCase):
         self.player.show()
         self.app.processEvents()
         self.assertFalse(hasattr(self.player, "header"))
-        self.assertEqual(self.lobby.campaign_title.text(), "参与者界面团")
+        self.assertEqual(self.player.title_bar.caption.text(), "参与者界面团")
+        sidebar = self.lobby.connection_status.parentWidget().layout()
+        self.assertIs(sidebar.itemAt(0).widget(), self.lobby.connection_status)
         self.assertEqual(self.lobby.channel_choice.findChildren(QPushButton), [])
-        buttons = {button.text() for button in self.lobby.findChildren(QPushButton)}
-        self.assertEqual(buttons, {"频道简介", "频道成员", "log", "个人属性", "断开连接", "发送"})
+        header = self.lobby.channel_header
+        buttons = {button.text() for button in self.lobby.findChildren(QPushButton)
+                   if button is not header.description_button}
+        self.assertEqual(buttons, {"个人属性", "断开连接"})
+        self.assertLessEqual(header.height(), 50)
+        self.assertEqual(header.description_button.accessibleName(), "频道简介")
+        self.assertLess(header.description_button.geometry().right(), header.members_button.geometry().left())
+        for button, tooltip in ((header.members_button, "频道成员"), (header.history_button, "聊天记录")):
+            self.assertEqual(button.toolTip(), tooltip)
+            self.assertEqual(button.toolButtonStyle(), Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.assertFalse(button.icon().isNull())
         self.assertEqual(self.lobby.connection_status.text(), "已开启-已连接")
         self.lobby.connection_button.click()
         self.wait(lambda: not self.lobby.is_online)
@@ -172,6 +274,8 @@ class ParticipantUiTests(unittest.TestCase):
 
     def test_main_scroll_and_log_have_independent_paging_and_cached_member_data(self):
         self.select(self.first)
+        self.assertEqual(self.lobby.channel_header.title.text(), "旧码头")
+        self.assertEqual(self.lobby.channel_info_button.text(), "夜间调查")
         self.lobby.chat_history.request_older()
         self.wait(lambda: self.lobby._history_request is None)
         self.assertIn("记录 026", self.lobby.chat_history.toPlainText())
@@ -226,7 +330,7 @@ class ParticipantUiTests(unittest.TestCase):
             log.history.request_older()
         self.assertIn("记录 001", log.history.toPlainText())
         self.assertEqual(self.lobby.channel_choice.topLevelItemCount(), 2)
-        self.assertFalse(self.lobby.send_button.isEnabled())
+        self.assertFalse(self.lobby.message.send_available)
 
     def test_open_log_is_reloaded_when_history_permissions_narrow(self):
         lobby_id = next(key for key, channel in self.lobby._channels.items() if channel["kind"] == "lobby")
@@ -254,7 +358,6 @@ class ParticipantUiTests(unittest.TestCase):
         self.assertEqual((dialog.identity.text(), dialog.name.text(), dialog.password.text()), ("PL", "林舟", "123456"))
         self.assertTrue(all(field.isReadOnly() for field in (dialog.identity, dialog.name, dialog.password)))
         self.assertTrue(dialog.change_button.isEnabled())
-        self.assertEqual(self.lobby.campaign_title.contextMenuPolicy(), Qt.ContextMenuPolicy.NoContextMenu)
         self.assertFalse(hasattr(self.player, "_identity_menu"))
         self.assertFalse(hasattr(self.player, "logout_button"))
         self.assertFalse(hasattr(self.player, "_logout"))

@@ -11,6 +11,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from client.player_window import PlayerWindow
@@ -227,7 +228,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         self.assertIn(scene, lobby._channels)
         lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData(scene))
         self.wait(lambda: "保留的线索" in lobby.chat_history.toPlainText())
-        self.assertFalse(lobby.send_button.isEnabled())
+        self.assertFalse(lobby.message.send_available)
         with self.assertRaises(ChatSendError) as denied:
             save_lobby_message(self.directory, "forged", ".ra 侦查", token=player.session.token, channel_id=scene)
         self.assertEqual(denied.exception.code, "attributes_required")
@@ -242,10 +243,10 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         paste.submit_button.click()
         self.wait(lambda: paste.submit_button.isEnabled())
         self.assertIn("不一致", paste.feedback.text())
-        self.assertFalse(lobby.send_button.isEnabled())
+        self.assertFalse(lobby.message.send_available)
         paste.text.setPlainText(f"| {ATTRIBUTE_COMMAND} |\n| --- |\n| |")
         paste.submit_button.click()
-        self.wait(lambda: player._attribute_sheet is not None and lobby.send_button.isEnabled())
+        self.wait(lambda: player._attribute_sheet is not None and lobby.message.send_available)
         self.assertFalse(hasattr(player._attribute_sheet, "reset_button"))
         self.assertEqual(player._attribute_sheet.attributes_table.item(0, 1).text(), "50")
         self.assertEqual(player._attribute_sheet.skills_table.item(0, 2).text(), "5")
@@ -277,7 +278,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         QTimer.singleShot(0, open_sheet)
         self.window.edit_button.click()
         self.assertEqual(seen, ["50", False])
-        self.wait(lambda: not lobby.send_button.isEnabled() and player._attribute_sheet is None)
+        self.wait(lambda: not lobby.message.send_available and player._attribute_sheet is None)
         self.assertEqual(button.text(), "导入属性")
         self.assertIn("保留的线索", lobby.chat_history.toPlainText())
         self.assertEqual(lobby._channel_id, scene)
@@ -299,12 +300,19 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         second = self.create_from_group_button(group, "钟楼", [member, observer])
         self.wait(lambda: second in player.lobby._channels)
         self.assertEqual(player.lobby._channel_id, lobby_id)
+        self.window.server.command("say", text="码头有新线索", channel_id=first)
+        unread_role = Qt.ItemDataRole.AccessibleDescriptionRole
+        player_tree = player.lobby.channel_choice
+        self.wait(lambda: player_tree._items[first].data(0, unread_role) == "有未读消息")
+        player_tree.setCurrentIndex(player_tree.findData(first))
+        self.wait(lambda: player.lobby._history_request is None)
+        self.assertEqual(player_tree._items[first].data(0, unread_role), "")
         for channel in (first, second, lobby_id):
             player.lobby.channel_choice.setCurrentIndex(player.lobby.channel_choice.findData(channel))
             self.wait(lambda: player.lobby._history_request is None)
-            self.assertTrue(player.lobby.send_button.isEnabled())
+            self.assertTrue(player.lobby.message.send_available)
             player.lobby.message.setPlainText(f"发送到 {channel}")
-            player.lobby.send_button.click()
+            QTest.keyClick(player.lobby.message, Qt.Key.Key_Return)
             self.wait(lambda: not player.lobby._awaiting_send)
         self.window.channel_choice.setCurrentIndex(self.window.channel_choice.findData(first))
         self.wait(lambda: not self.window._busy)
@@ -338,7 +346,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         management.save.click()
         self.wait(lambda: self.window._channels[second]["name"] == "高塔" and self.window._channel_request is None)
         self.assertEqual(self.window.channel_title.text(), "高塔")
-        self.assertEqual(self.window._channels[second]["description"], "夜间调查")
+        self.assertEqual(self.window.channel_info_button.text(), "夜间调查")
         self.wait(lambda: player.lobby._channels[second]["name"] == "高塔")
         # Saving unchanged values must not make a later edit falsely stale.
         management.save.click()
@@ -347,6 +355,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         management.save.click()
         self.wait(lambda: self.window._channel_request is None)
         self.assertEqual(self.window._channels[second]["description"], "更新后的简介")
+        self.assertEqual(self.window.channel_info_button.text(), "更新后的简介")
 
     def test_closing_listening_main_page_returns_to_identity_selection(self):
         role = RoleWindow(self.root)
@@ -360,7 +369,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         self.start(host)
         host.network_status.click()
         self.assertTrue(host.connection_dialog.isVisible())
-        host.close()
+        host.title_bar.close_button.click()
         self.wait(lambda: role._window is None and role.isVisible())
         role.deleteLater()
         self.app.processEvents()

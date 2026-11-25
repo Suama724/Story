@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtNetwork import QAbstractSocket
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from client.auth_client import ClientSession, server_urls
@@ -148,12 +149,13 @@ class ClientGuiTests(unittest.TestCase):
 
     def test_first_login_enters_lobby_and_binds_sender(self) -> None:
         self.ready_player()
-        self.assertIn("调查员甲", self.player.windowTitle())
+        self.assertEqual(self.player.title_bar.caption.text(), "玩家联调团")
+        self.assertEqual(self.player.title_bar.identity.text(), "调查员甲")
         self.assertTrue(self.player.lobby.nickname.isReadOnly())
         self.server.command("say", text="欢迎调查员 🎲")
         self.wait_until(lambda: "欢迎调查员 🎲" in self.player.lobby.chat_history.toPlainText())
         self.player.lobby.message.setPlainText("中文 🎲\n第二行  ")
-        self.player.lobby.send_button.click()
+        QTest.keyClick(self.player.lobby.message, Qt.Key.Key_Return)
         self.wait_until(lambda: not self.player.lobby._awaiting_send)
         self.assertEqual(self.player.lobby.message.toPlainText(), "")
         self.player.lobby.socket.sendTextMessage(json.dumps({
@@ -161,8 +163,8 @@ class ClientGuiTests(unittest.TestCase):
         }))
         self.wait_until(lambda: "伪造发言人" in self.player.lobby.chat_history.toPlainText())
         history = self.player.lobby.chat_history.toPlainText()
-        self.assertEqual(history.count("调查员甲：中文 🎲\n第二行  "), 1)
-        self.assertIn("调查员甲：伪造发言人", history)
+        self.assertEqual(history.count("调查员甲\n中文 🎲\n第二行  "), 1)
+        self.assertIn("调查员甲\n伪造发言人", history)
 
     def test_lobby_resizes_and_restores_login_window_online_and_offline(self) -> None:
         self.player.show()
@@ -185,6 +187,8 @@ class ClientGuiTests(unittest.TestCase):
         self.login(self.player, DEFAULT_PASSWORD)
         self.assertIsNotNone(self.player.lobby)
         self.assertIsNone(self.player.session)
+        self.assertEqual(self.player.title_bar.caption.text(), "玩家联调团")
+        self.assertEqual(self.player.title_bar.identity.text(), "调查员甲")
         self.assertGreater(self.player.height(), login_geometry.height())
         self.assertGreater(self.player.lobby.chat_history.height(), 200)
         self.player._session_rejected()
@@ -204,13 +208,14 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: self.player.lobby is not None and self.player.lobby._channel_state_ready)
         ob = self.player.lobby
         self.assertEqual(self.player.session.role, "ob")
+        self.assertEqual(self.player.title_bar.identity.text(), "旁观者")
         self.assertEqual(self.player.personal_info_dialog.identity.text(), "OB")
         self.assertFalse(hasattr(self.player, "header"))
         for channel in (scene, archive):
             ob.channel_choice.setCurrentIndex(ob.channel_choice.findData(channel))
             self.wait_until(lambda: "OB 加入前的完整记录" in ob.chat_history.toPlainText())
             self.assertTrue(ob.message.isReadOnly())
-            self.assertFalse(ob.send_button.isEnabled())
+            self.assertFalse(ob.message.send_available)
         self.server.command("scene.create", name="后来创建的现场", member_ids=[], channel_id="future-scene")
         self.wait_until(lambda: "future-scene" in ob._channels)
         replies = []
@@ -219,17 +224,18 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: any(item.get("request_id") == "ob-forged" for item in replies))
         self.assertEqual(next(item for item in replies if item.get("request_id") == "ob-forged")["code"], "channel_forbidden")
         ob.channel_choice.setCurrentIndex(ob.channel_choice.findData(ob._assigned_channel_id))
-        self.wait_until(lambda: ob.send_button.isEnabled())
+        self.wait_until(lambda: ob.message.send_available)
         ob.message.setPlainText("OB 场外聊天")
-        ob.send_button.click()
-        self.wait_until(lambda: "旁观者：OB 场外聊天" in ob.chat_history.toPlainText())
+        QTest.keyClick(ob.message, Qt.Key.Key_Return)
+        self.wait_until(lambda: "旁观者\nOB 场外聊天" in ob.chat_history.toPlainText())
         self.player._request("nickname", {"nickname": "新昵称"})
         self.wait_until(lambda: not self.player._busy)
         self.assertEqual(self.player.session.actor_name, "新昵称")
+        self.assertEqual(self.player.title_bar.identity.text(), "新昵称")
         self.assertEqual(self.player.history.entries()[0]["actor_name"], "新昵称")
         ob.message.setPlainText("改名后仍在线")
-        ob.send_button.click()
-        self.wait_until(lambda: "新昵称：改名后仍在线" in ob.chat_history.toPlainText())
+        QTest.keyClick(ob.message, Qt.Key.Key_Return)
+        self.wait_until(lambda: "新昵称\n改名后仍在线" in ob.chat_history.toPlainText())
         self.player._pending_password = "新观众密码"
         self.player._request("password", {"current_password": "观众密码", "new_password": "新观众密码"})
         self.wait_until(lambda: not self.player._busy)
@@ -417,7 +423,7 @@ class ClientGuiTests(unittest.TestCase):
         draft = "停服时的草稿 🎲"
         lobby.socket.textMessageReceived.disconnect(lobby._show_message)
         lobby.message.setPlainText(draft)
-        lobby.send_button.click()
+        QTest.keyClick(lobby.message, Qt.Key.Key_Return)
         self.wait_until(lambda: any(event["text"] == draft for event in self.server_messages))
         self.assertTrue(lobby._awaiting_send)
         self.server.stop()
@@ -432,13 +438,13 @@ class ClientGuiTests(unittest.TestCase):
         self.wait_until(lambda: lobby.socket.state() == CONNECTED)
         self.server.command("say", text="重启后的新消息")
         self.wait_until(lambda: "重启后的新消息" in lobby.chat_history.toPlainText())
-        # 实时消息可能先于频道权限恢复；按钮可用后才模拟用户重发。
-        self.wait_until(lobby.send_button.isEnabled)
-        lobby.send_button.click()
+        # 实时消息可能先于频道权限恢复。
+        self.wait_until(lambda: lobby.message.send_available)
+        QTest.keyClick(lobby.message, Qt.Key.Key_Return)
         self.wait_until(lambda: not lobby._awaiting_send and lobby.message.toPlainText() == "")
         self.assertEqual(lobby.message.toPlainText(), "")
         self.assertEqual(lobby.chat_history.toPlainText().splitlines(), [
-            f"调查员甲：{draft}", "KP：重启后的新消息",
+            "调查员甲", draft, "KP", "重启后的新消息",
         ])
         self.assertEqual(sum(event["text"] == draft for event in self.server_messages), 1)
 
@@ -540,7 +546,9 @@ class ClientGuiTests(unittest.TestCase):
 
         self.assertEqual(requested, [("after", 1), ("after", 51)])
         self.assertEqual(lobby.chat_history.toPlainText().splitlines(), [
-            "KP：掉线前", *(f"KP：漏收 {number:02d}" for number in range(1, 56)), "KP：同步时的新线索 🎲",
+            "KP", "掉线前",
+            *(line for number in range(1, 56) for line in ("KP", f"漏收 {number:02d}")),
+            "KP", "同步时的新线索 🎲",
         ])
         self.assertEqual(lobby._cache.position(), 57)
 
@@ -554,7 +562,7 @@ class ClientGuiTests(unittest.TestCase):
         self.assertEqual(self.player.history.entries()[0]["password"], DEFAULT_PASSWORD)
         lobby = self.player.lobby
         self.wait_until(lambda: "历史 055" in lobby.chat_history.toPlainText())
-        self.assertEqual(len(lobby.chat_history.toPlainText().splitlines()), 50)
+        self.assertEqual(lobby.chat_history.document().blockCount(), 50)
         lobby.chat_history.request_older()
         self.wait_until(lambda: "历史 001" in lobby.chat_history.toPlainText())
 
@@ -580,7 +588,7 @@ class ClientGuiTests(unittest.TestCase):
         lobby = reopened.lobby
         self.assertTrue(lobby.connection_status.text().endswith("-未连接"))
         self.assertTrue(lobby.message.isReadOnly())
-        self.assertFalse(lobby.send_button.isEnabled())
+        self.assertFalse(lobby.message.send_available)
         self.assertIn("历史 055", lobby.chat_history.toPlainText())
         lobby.chat_history.request_older()
         self.assertIn("历史 001", lobby.chat_history.toPlainText())
@@ -594,8 +602,8 @@ class ClientGuiTests(unittest.TestCase):
         lobby = reopened.lobby
         self.wait_until(lambda: "历史 110" in lobby.chat_history.toPlainText())
         lines = lobby.chat_history.toPlainText().splitlines()
-        self.assertEqual(lines, [f"KP：历史 {number:03d}" for number in range(1, 111)])
-        self.assertTrue(lobby.send_button.isEnabled())
+        self.assertEqual(lines, [line for number in range(1, 111) for line in ("KP", f"历史 {number:03d}")])
+        self.assertTrue(lobby.message.send_available)
 
     def test_password_rejected_by_host_cannot_unlock_offline_history(self) -> None:
         self.ready_player()
@@ -626,7 +634,7 @@ class ClientGuiTests(unittest.TestCase):
         self.assertEqual(lobby._channel_id, lobby_id)
         lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData("offline-scene"))
         lobby.message.setPlainText("场景中的发言")
-        lobby.send_button.click()
+        QTest.keyClick(lobby.message, Qt.Key.Key_Return)
         self.wait_until(lambda: not lobby._awaiting_send)
         lobby.disconnect_button.click()
         self.wait_until(lambda: lobby.socket.state() == UNCONNECTED)
@@ -638,12 +646,12 @@ class ClientGuiTests(unittest.TestCase):
         lobby.connect_button.click()
         self.wait_until(lambda: lobby._channel_state_ready and lobby._assigned_channel_id == lobby_id)
         self.assertEqual(lobby._channel_id, "offline-scene")
-        self.assertFalse(lobby.send_button.isEnabled())
+        self.assertFalse(lobby.message.send_available)
         lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData(lobby_id))
         self.assertEqual(lobby.message.toPlainText(), "大厅未发草稿")
         lobby.channel_choice.setCurrentIndex(lobby.channel_choice.findData("offline-scene"))
         self.wait_until(lambda: "场景中的发言" in lobby.chat_history.toPlainText())
-        self.assertFalse(lobby.send_button.isEnabled())
+        self.assertFalse(lobby.message.send_available)
 
 
 if __name__ == "__main__":
