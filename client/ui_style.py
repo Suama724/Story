@@ -88,7 +88,7 @@ QPushButton#groupAdd:hover {{ background: {SELECTION}; }}
 QPushButton#groupAdd:focus {{ border-color: {FOCUS}; }}
 """
 
-CHAT_SCROLLBAR_STYLE = f"""
+SLIM_SCROLLBAR_STYLE = f"""
 QScrollBar:vertical {{ width: 9px; margin: 3px 2px 3px 0; background: transparent; border: none; }}
 QScrollBar::handle:vertical {{ min-height: 28px; background: {BORDER}; border-radius: 3px; }}
 QScrollBar::handle:vertical:hover {{ background: {DISABLED}; }}

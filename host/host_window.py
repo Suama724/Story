@@ -25,8 +25,8 @@ from client.chat_history import ChatHistory
 from client.channel_tree import ChannelTree
 from client.player_window import identity_list
 from client.ui_style import (
-    BACKGROUND, BORDER, BUTTON_STYLE, CHANNEL_NAV_STYLE, DANGER, FOCUS, MUTED, SELECTION, SIDEBAR, SURFACE, TEXT,
-    apply_theme,
+    BACKGROUND, BORDER, BUTTON_STYLE, CHANNEL_NAV_STYLE, DANGER, FOCUS, ICON_ROOT, MUTED, SELECTION, SIDEBAR,
+    SLIM_SCROLLBAR_STYLE, SURFACE, TEXT, apply_theme,
 )
 from client.ui_widgets import ElidedButton, split_channel_view
 from client.window_title_bar import BAR_HEIGHT, window_layout
@@ -58,6 +58,14 @@ QLineEdit, QSpinBox, QPlainTextEdit, QTextEdit, QComboBox, QListWidget, QTableWi
     padding: 5px; selection-background-color: {SELECTION}; selection-color: {TEXT};
 }}
 QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus {{ border-color: {FOCUS}; }}
+QComboBox#rulesChoice {{ padding-right: 32px; }}
+QComboBox#rulesChoice::drop-down {{
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 30px; border: none; background: transparent;
+}}
+QComboBox#rulesChoice::down-arrow {{
+    image: url("{(ICON_ROOT / 'bold' / 'caret-down-bold.svg').as_posix()}"); width: 14px; height: 14px;
+}}
 QHeaderView::section {{ background: {SIDEBAR}; color: {MUTED}; padding: 7px; border: none; }}
 QTabWidget::pane {{ border: none; }}
 QTabBar::tab {{ padding: 9px 18px; background: {BACKGROUND}; color: {MUTED}; }}
@@ -303,6 +311,7 @@ class HostWindow(QMainWindow):
         columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(20)
         self.campaign_list = identity_list()
+        self.campaign_list.verticalScrollBar().setStyleSheet(SLIM_SCROLLBAR_STYLE)
         self.campaign_list.setAccessibleName("选择团")
         self.campaign_list.currentItemChanged.connect(self._fill_selected_campaign)
         self.campaign_list.itemClicked.connect(self._fill_selected_campaign)
@@ -318,6 +327,7 @@ class HostWindow(QMainWindow):
         form.setSpacing(14)
         form.addRow("团名", self.new_name)
         self.rules_choice = QComboBox()
+        self.rules_choice.setObjectName("rulesChoice")
         self.rules_choice.addItem("coc7", "coc7")
         self.rules_choice.currentIndexChanged.connect(
             lambda _: self.rulesetSelected.emit(self.rules_choice.currentData()))

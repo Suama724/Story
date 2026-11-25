@@ -6,7 +6,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QTextOption
 from PySide6.QtWidgets import QPlainTextEdit
 
-from .ui_style import BORDER, CHAT_SCROLLBAR_STYLE, FOCUS, SELECTION, SURFACE, TEXT
+from .ui_style import BORDER, FOCUS, SELECTION, SLIM_SCROLLBAR_STYLE, SURFACE, TEXT
 
 
 MAX_VISIBLE_LINES = 8
@@ -28,7 +28,7 @@ class ChatComposer(QPlainTextEdit):
         self.send_available = False
         self._composing = False
         self.setObjectName("chatComposer")
-        self.setStyleSheet(STYLE + CHAT_SCROLLBAR_STYLE)
+        self.setStyleSheet(STYLE + SLIM_SCROLLBAR_STYLE)
         self.setAccessibleName("消息输入")
         self.setAccessibleDescription("Enter 发送，Shift+Enter 换行")
         self.setTabChangesFocus(True)

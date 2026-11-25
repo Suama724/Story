@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from .player_window import PlayerWindow
 from .ui_style import STYLE
-from .window_title_bar import BAR_HEIGHT, window_layout
+from .window_title_bar import window_layout
 
 
 class RoleWindow(QWidget):
@@ -16,11 +16,10 @@ class RoleWindow(QWidget):
         super().__init__()
         self.data_root = data_root
         self._window: QWidget | None = None
-        self.resize(420, 176 + BAR_HEIGHT)
-        self.setMinimumSize(320, 160 + BAR_HEIGHT)
+        self.setMinimumWidth(320)
         self.setStyleSheet(STYLE)
         self.title_bar, layout = window_layout(self, self, "选择身份")
-        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setContentsMargins(24, 16, 24, 16)
         layout.setSpacing(12)
         for title, opened in (
             ("作为参与者", self._open_player),
@@ -30,6 +29,8 @@ class RoleWindow(QWidget):
             button.setMinimumHeight(48)
             button.clicked.connect(opened)
             layout.addWidget(button, 1)
+        self.resize(420, self.sizeHint().height())
+        self.setFocus()
 
     def _open_player(self) -> None:
         self._show_window(PlayerWindow())

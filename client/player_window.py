@@ -27,7 +27,7 @@ LOGIN_ERRORS = {
     "role_mismatch": "身份不匹配，请选择正确的 PL 或 OB。",
 }
 
-from .ui_style import BACKGROUND, BORDER, FOCUS, HOVER, SELECTION, STYLE, SURFACE, TEXT
+from .ui_style import BACKGROUND, BORDER, FOCUS, HOVER, SELECTION, SLIM_SCROLLBAR_STYLE, STYLE, SURFACE, TEXT
 from .window_title_bar import BAR_HEIGHT, window_layout
 
 
@@ -194,6 +194,7 @@ class PlayerWindow(QWidget):
         layout.addWidget(self.feedback)
         self._load_history()
         self._update_controls()
+        self.setFocus()
 
     def _login_page(self) -> QWidget:
         page = QWidget()
@@ -201,6 +202,7 @@ class PlayerWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(20)
         self.saved_logins = identity_list()
+        self.saved_logins.verticalScrollBar().setStyleSheet(SLIM_SCROLLBAR_STYLE)
         self.saved_logins.setAccessibleName("选择身份")
         self.saved_logins.currentItemChanged.connect(self._select_saved_login)
         self.saved_logins.itemClicked.connect(self._select_saved_login)
@@ -570,6 +572,7 @@ class PlayerWindow(QWidget):
         self.title_bar.set_caption("参与者登录")
         self.feedback.setText(message)
         self._update_controls()
+        self.setFocus()
 
     def _session_rejected(self) -> None:
         self._reset_login("会话已失效，请重新登录。未发送的草稿已保留。")

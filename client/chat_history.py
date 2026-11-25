@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QTextBlockFo
 from PySide6.QtWidgets import QTextEdit, QWidget
 
 from .ui_icons import phosphor_icon
-from .ui_style import CHAT_SCROLLBAR_STYLE, DISABLED, MUTED, SELECTION, SIDEBAR, SURFACE, TEXT
+from .ui_style import DISABLED, MUTED, SELECTION, SIDEBAR, SLIM_SCROLLBAR_STYLE, SURFACE, TEXT
 
 
 AVATAR_SIZE = 34
@@ -75,7 +75,7 @@ class ChatHistory(QTextEdit):
             self._name_style.setFontWeight(QFont.Weight.DemiBold)
             self._body_style.setForeground(QColor(TEXT))
             self.setObjectName("conversationHistory")
-            self.setStyleSheet(CONVERSATION_STYLE + CHAT_SCROLLBAR_STYLE)
+            self.setStyleSheet(CONVERSATION_STYLE + SLIM_SCROLLBAR_STYLE)
             self.setAccessibleName("频道消息")
             self.document().setDocumentMargin(12)
         self.verticalScrollBar().valueChanged.connect(self._scrolled)
