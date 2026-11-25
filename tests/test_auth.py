@@ -20,11 +20,14 @@ from urllib.request import ProxyHandler, Request, build_opener
 import uvicorn
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
+from dice_component import RuleConfig
 
 from host import migrations
 from host.app import create_app
 from host.auth import AuthError, AuthService, DEFAULT_PASSWORD
+from host.dice import save_local_dice_config
 from host.management import add_member, edit_member, list_members
+from host.messages import local_lobby_history
 from host.storage import DATABASE_NAME, campaign_info, create_member, initialize_campaign, open_campaign
 from tests.attribute_fixtures import add_ready_player
 
@@ -333,6 +336,87 @@ class AuthNetworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ack["type"], "chat.ack")
             self.assertEqual(ack["message"]["sequence"], 1)
             self.assertEqual(json.loads(await asyncio.wait_for(websocket.recv(), timeout=3)), ack["message"])
+
+    async def test_dice_visibility_rules_and_replay(self) -> None:
+        session = await self.login()
+        add_member(self.directory, "观众", role="ob")
+        observer = self.application.state.auth.login("联网测试", "观众", DEFAULT_PASSWORD, "ob")
+        save_local_dice_config(self.directory, RuleConfig(custom=True, critical_max=5, fumble_min=95))
+        with open_campaign(self.directory) as db, db:
+            db.execute("UPDATE campaigns SET dice_config = json_set(dice_config, '$.require_success', json('true'), "
+                       "'$.require_failure', json('true'))")
+        fixed = {"version": "test", "critical": False, "fumble": False, "total": None, "rands": [
+            {"kind": "tens_d10", "value": 0}, {"kind": "tens_d10", "value": 10},
+            {"kind": "normal", "value": 5},
+        ]}
+        app_lobby = self.application.state.lobby
+        with patch("dice_component.core._worker", return_value=fixed) as engine:
+            async with (
+                connect(self.ws, additional_headers={"Authorization": f"Bearer {session['token']}"}, proxy=None) as pl,
+                connect(self.ws, additional_headers={"Authorization": f"Bearer {observer['token']}"}, proxy=None) as ob,
+            ):
+                async def read(socket):
+                    return json.loads(await asyncio.wait_for(socket.recv(), timeout=3))
+
+                async def send(socket, request_id, text):
+                    await socket.send(json.dumps({"type": "chat.send", "request_id": request_id, "text": text}))
+                    return await read(socket)
+
+                self.assertEqual((await send(pl, "denied", ".rah b 侦查"))["code"], "dice_secret_forbidden")
+                self.assertEqual((await send(ob, "observer", ".r 1d6"))["code"], "dice_role_forbidden")
+                self.assertEqual(engine.call_count, 0)
+                async with app_lobby.lock:
+                    command = "\n\ufeff  ．rah b 侦察 @调查员"
+                    await app_lobby.send_campaign_message(command, "secret")
+                    await app_lobby.send_campaign_message(command, "secret")
+                self.assertEqual(engine.call_count, 1)
+                ack = await send(pl, "public", ".ra b 极难诗学")
+                self.assertEqual(ack["message"]["sequence"], 1)
+                self.assertEqual(await read(pl), ack["message"])
+                public = await read(pl)
+                self.assertEqual((public["sequence"], public["nickname"], public["kind"]), (2, "骰子", "dice_result"))
+                self.assertIn("5 / 2，大成功。", public["text"])
+                self.assertNotIn("local_sequence", public)
+                self.assertEqual(await read(ob), ack["message"])
+                self.assertEqual(await read(ob), public)
+                self.assertEqual((await send(pl, "public", ".ra b 极难诗学"))["result"], public)
+                self.assertEqual(engine.call_count, 2)
+
+                await ob.send(json.dumps({"type": "chat.history.get", "mode": "latest"}))
+                self.assertEqual((await read(ob))["messages"], [ack["message"], public])
+                local = local_lobby_history(self.directory)["messages"]
+                self.assertEqual([message["sequence"] for message in local], [1, 2, 3, 4])
+                self.assertEqual([message["public_sequence"] for message in local], [None, None, 1, 2])
+                self.assertTrue(local[0]["text"].startswith("【暗骰】"))
+                self.assertEqual(local[1]["nickname"], "骰子")
+                self.assertEqual(local_lobby_history(self.directory, before=3)["messages"], local[:2])
+
+    async def test_dice_skill_alias_after_successful_roll(self) -> None:
+        session = await self.login()
+        fixed = {"critical": False, "fumble": False, "total": None, "rands": [
+            {"kind": "tens_d10", "value": 30}, {"kind": "normal", "value": 9},
+        ]}
+        with patch("dice_component.core._worker", return_value=fixed):
+            async with connect(self.ws, additional_headers={
+                "Authorization": f"Bearer {session['token']}",
+            }, proxy=None) as player:
+                async def read():
+                    return json.loads(await asyncio.wait_for(player.recv(), timeout=3))
+
+                for index, (command, expected) in enumerate((
+                    (".ra 敏捷", "敏捷检定"), (".ra 侦察", "侦查检定"),
+                    (".ra 查无此技能", None), (".ra 侦察", "侦查检定"),
+                )):
+                    await player.send(json.dumps({"type": "chat.send", "request_id": str(index), "text": command}))
+                    reply = await read()
+                    if expected is None:
+                        self.assertEqual(reply["code"], "dice_attribute_missing")
+                        continue
+                    self.assertEqual(reply["type"], "chat.ack")
+                    self.assertEqual(await read(), reply["message"])
+                    result = await read()
+                    self.assertEqual(result["kind"], "dice_result")
+                    self.assertEqual(result["text"], f"调查员的{expected}：39 / 65，普通成功。")
 
     async def test_relogin_closes_old_socket_and_invalidates_old_token(self) -> None:
         first = await self.login()

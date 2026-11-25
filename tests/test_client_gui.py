@@ -3,6 +3,8 @@
 import json
 import os
 import socket
+import sqlite3
+from contextlib import closing
 import tempfile
 import time
 import unittest
@@ -64,6 +66,21 @@ class AddressTests(unittest.TestCase):
 
 
 class HistoryCacheTests(unittest.TestCase):
+    def test_cached_dice_kind_survives_reopen_and_legacy_resync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            cache = HistoryCache(path, "campaign", "member")
+            message = {"message_id": "roll", "sequence": 1, "nickname": "骰子", "text": "1d6 = 4"}
+            cache.save([message], latest=True)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("ALTER TABLE messages DROP COLUMN kind")
+            reopened = HistoryCache(path, "campaign", "member")
+            self.assertEqual(reopened.page(), [message])
+            dice = {**message, "kind": "dice_result"}
+            reopened.save([dice])
+            reopened.save([message])
+            self.assertEqual(HistoryCache(path, "campaign", "member").page(), [dice])
+
     def test_scope_and_sync_position_survive_reopen_without_skipping_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.sqlite3"

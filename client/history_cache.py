@@ -37,17 +37,22 @@ class HistoryCache:
                 connection.execute("""CREATE TABLE IF NOT EXISTS messages (
                 campaign_id TEXT NOT NULL, member_id TEXT NOT NULL, channel_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL,
-                message_id TEXT NOT NULL, nickname TEXT NOT NULL, text TEXT NOT NULL,
+                message_id TEXT NOT NULL, nickname TEXT NOT NULL, text TEXT NOT NULL, kind TEXT,
                 PRIMARY KEY (campaign_id, member_id, channel_id, sequence),
                 UNIQUE (campaign_id, member_id, channel_id, message_id))""")
                 connection.execute("""CREATE TABLE IF NOT EXISTS sync_positions (
                 campaign_id TEXT NOT NULL, member_id TEXT NOT NULL, channel_id TEXT NOT NULL,
                 sequence INTEGER NOT NULL, PRIMARY KEY (campaign_id, member_id, channel_id))""")
                 if old_columns and "channel_id" not in old_columns:
-                    connection.execute("INSERT INTO messages SELECT campaign_id, member_id, '', sequence, message_id, nickname, text FROM legacy_messages")
+                    connection.execute(
+                        """INSERT INTO messages (campaign_id, member_id, channel_id, sequence, message_id, nickname, text)
+                           SELECT campaign_id, member_id, '', sequence, message_id, nickname, text FROM legacy_messages""",
+                    )
                     connection.execute("INSERT INTO sync_positions SELECT campaign_id, member_id, '', sequence FROM legacy_sync_positions")
                     connection.execute("DROP TABLE legacy_messages")
                     connection.execute("DROP TABLE legacy_sync_positions")
+                elif old_columns and "kind" not in old_columns:
+                    connection.execute("ALTER TABLE messages ADD COLUMN kind TEXT")
                 connection.execute("""CREATE TABLE IF NOT EXISTS channel_states (
                     campaign_id TEXT NOT NULL, member_id TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY (campaign_id, member_id))""")
@@ -92,12 +97,12 @@ class HistoryCache:
     def page(self, before: int | None = None) -> list[dict]:
         with self._open() as connection:
             rows = connection.execute(
-                """SELECT message_id, sequence, nickname, text FROM messages
+                """SELECT message_id, sequence, nickname, text, kind FROM messages
                    WHERE campaign_id = ? AND member_id = ? AND channel_id = ? AND sequence <= ?
                    ORDER BY sequence DESC LIMIT ?""",
                 (*self.scope, before - 1 if before is not None else 2**63 - 1, HISTORY_PAGE_SIZE),
             ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        return [{key: value for key, value in dict(row).items() if value is not None} for row in reversed(rows)]
 
     def position(self) -> int | None:
         with self._open() as connection:
@@ -113,9 +118,12 @@ class HistoryCache:
         with self._open() as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.executemany(
-                """INSERT INTO messages (campaign_id, member_id, channel_id, sequence, message_id, nickname, text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-                ((*self.scope, item["sequence"], item["message_id"], item["nickname"], item["text"])
+                """INSERT INTO messages (campaign_id, member_id, channel_id, sequence, message_id, nickname, text, kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO UPDATE SET kind = excluded.kind
+                   WHERE messages.message_id = excluded.message_id AND messages.kind IS NULL
+                         AND excluded.kind IS NOT NULL""",
+                ((*self.scope, item["sequence"], item["message_id"], item["nickname"], item["text"], item.get("kind"))
                  for item in messages),
             )
             previous_position = position = self._position(connection)

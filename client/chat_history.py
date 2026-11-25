@@ -24,6 +24,7 @@ QTextEdit#conversationHistory {{
 class _Message(NamedTuple):
     nickname: str
     text: str
+    dice_result: bool
 
 
 class _HistoryFade(QWidget):
@@ -53,6 +54,7 @@ class ChatHistory(QTextEdit):
         self._records: dict[int, _Message] = {}
         self._queue: deque[int] = deque()
         self._last_sequence = 0
+        self.newest_public_sequence = 0
         self.has_more = False
         self.history_loading = False
         self._updating = False
@@ -87,6 +89,7 @@ class ChatHistory(QTextEdit):
         self._records.clear()
         self._queue.clear()
         self._last_sequence = 0
+        self.newest_public_sequence = 0
         self._updating = False
 
     def set_pagination(self, has_more: bool, loading: bool = False) -> None:
@@ -170,7 +173,8 @@ class ChatHistory(QTextEdit):
             cursor.insertText(name + "\u2028", self._name_style)
             cursor.insertText("\u2028".join(lines[first:end]), self._body_style)
         else:
-            cursor.insertText(f"{message.nickname}：{message.text}")
+            separator = ": " if message.dice_result else "："
+            cursor.insertText(message.nickname + separator + message.text)
 
     def add_message(self, event: dict[str, object]) -> None:
         self.add_messages([event])
@@ -190,9 +194,12 @@ class ChatHistory(QTextEdit):
             nickname, text = event.get("nickname"), event.get("text")
             if not isinstance(nickname, str) or not isinstance(text, str):
                 continue
-            message = _Message(nickname, text)
+            message = _Message(nickname, text, event.get("kind") == "dice_result")
             message_id, sequence = event.get("message_id"), event.get("sequence")
             if isinstance(message_id, str) and type(sequence) is int:
+                public_sequence = event.get("public_sequence", sequence)
+                if type(public_sequence) is int:
+                    self.newest_public_sequence = max(self.newest_public_sequence, public_sequence)
                 if message_id in self._message_ids:
                     continue
                 self._message_ids.add(message_id)

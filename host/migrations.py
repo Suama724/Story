@@ -3,7 +3,8 @@
 import sqlite3
 
 APPLICATION_ID = 0x53545259  # STRY
-SCHEMA_VERSION = 9
+DICE_SCHEMA_VERSION = 10
+SCHEMA_VERSION = DICE_SCHEMA_VERSION
 
 
 def _preserve_identity_triggers(connection: sqlite3.Connection) -> None:
@@ -224,6 +225,35 @@ MIGRATIONS = (
             ruleset TEXT NOT NULL,
             values_json TEXT NOT NULL,
             imported_at TEXT NOT NULL
+        )""",
+    ),
+    (
+        "ALTER TABLE campaigns ADD COLUMN dice_config TEXT NOT NULL DEFAULT '{}'",
+        "ALTER TABLE messages ADD COLUMN local_sequence INTEGER",
+        "UPDATE messages SET local_sequence = sequence",
+        "CREATE UNIQUE INDEX messages_local_order ON messages(channel_id, local_sequence)",
+        """CREATE TABLE private_dice_messages (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            channel_id TEXT NOT NULL REFERENCES channels(id),
+            local_sequence INTEGER NOT NULL,
+            member_id TEXT NOT NULL REFERENCES members(id),
+            actor_id TEXT NOT NULL REFERENCES actors(id),
+            nickname TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (channel_id, local_sequence)
+        )""",
+        """CREATE TABLE dice_invocations (
+            member_id TEXT NOT NULL REFERENCES members(id),
+            request_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL REFERENCES channels(id),
+            command_text TEXT NOT NULL,
+            private INTEGER NOT NULL CHECK (private IN (0, 1)),
+            input_id TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            roll_data TEXT NOT NULL,
+            PRIMARY KEY (member_id, request_id)
         )""",
     ),
 )

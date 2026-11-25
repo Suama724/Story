@@ -45,6 +45,7 @@ _ALIASES = {
     "信用": "信用评级", "信誉": "信用评级", "克苏鲁": "克苏鲁神话", "cm": "克苏鲁神话",
     "汽车": "汽车驾驶", "驾驶": "汽车驾驶", "汽车驾驭": "汽车驾驶",
     "图书馆": "图书馆使用", "图书馆利用": "图书馆使用", "开锁": "锁匠", "撬锁": "锁匠",
+    "侦察": "侦查", "偵察": "侦查", "偵查": "侦查",
     "自然学": "博物学", "领航": "导航", "重型操作": "操作重型机械",
     "重型机械": "操作重型机械", "重型": "操作重型机械",
     "射击(手枪)": "手枪", "格斗(斗殴)": "斗殴",
@@ -84,7 +85,7 @@ def parse_attributes(text: str) -> dict[str, int]:
         if match is None:
             raise ValueError(f"无法识别属性指令中的「{body[offset:offset + 18]}」。")
         name, amount = match.groups()
-        key = _ALIASES.get(name, name)
+        key = attribute_key(name)
         value = int(amount)
         if key in values and values[key] != value:
             raise ValueError(f"「{name}」与同一属性的其他数值不一致。")
@@ -97,6 +98,11 @@ def parse_attributes(text: str) -> dict[str, int]:
     return values
 
 
+def attribute_key(name: str) -> str:
+    normalized = _normalize(name)
+    return _ALIASES.get(normalized, normalized)
+
+
 def skill_defaults(values: dict[str, int]) -> dict[str, int]:
     return {
         name: default if default is not None else (values["dex"] // 2 if name == "闪避" else values["edu"])
@@ -105,10 +111,16 @@ def skill_defaults(values: dict[str, int]) -> dict[str, int]:
 
 
 def effective_attributes(values: dict[str, int]) -> dict[str, int]:
+    # 旧卡可能曾把后来加入的别名当作独立技能保存。明确的标准字段优先。
+    canonical = {}
+    for name, value in values.items():
+        key = attribute_key(name)
+        if key == name or key not in canonical:
+            canonical[key] = value
     return {
-        **skill_defaults(values),
-        "hp": (values["con"] + values["siz"]) // 10,
-        "mp": values["pow"] // 5,
-        "san": values["pow"],
-        **values,
+        **skill_defaults(canonical),
+        "hp": (canonical["con"] + canonical["siz"]) // 10,
+        "mp": canonical["pow"] // 5,
+        "san": canonical["pow"],
+        **canonical,
     }

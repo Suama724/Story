@@ -1,6 +1,7 @@
 """组织方新版窗口、真实在线状态、多频道关系与旧库升级的验收。"""
 
 import os
+import shutil
 import socket
 import tempfile
 import time
@@ -24,6 +25,8 @@ from host.channels import (
 )
 from client.attribute_dialogs import AttributeSheetDialog
 from host.host_window import HostWindow, MemberDialog, SceneDialog
+from host.dice import local_dice_config
+from host.dice_dialog import DiceManagementDialog
 from host.management import add_member
 from host.messages import ChatSendError, save_lobby_message
 from host.storage import campaign_info, initialize_campaign, open_campaign
@@ -283,6 +286,54 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         self.assertIn("保留的线索", lobby.chat_history.toPlainText())
         self.assertEqual(lobby._channel_id, scene)
         self.assertIsNone(player_attributes(self.directory, player.session.token)["attributes"])
+
+    @unittest.skipUnless(
+        shutil.which("node") and (Path(__file__).resolve().parents[1] / "dice_component/node_modules/bcdice").is_dir(),
+        "运行 npm ci --prefix dice_component 安装骰核",
+    )
+    def test_dice_settings_and_private_result_in_host_chat(self):
+        self.window.show()
+        sidebar = self.window.participants_button.parentWidget().layout()
+        self.assertEqual(sidebar.indexOf(self.window.dice_management_button) + 1,
+                         sidebar.indexOf(self.window.participants_button))
+        self.assertEqual(self.window.dice_management_button.text(), "掷骰管理")
+        outcomes = []
+        labels = []
+
+        def edit_dice_settings():
+            dialog = QApplication.activeModalWidget()
+            if isinstance(dialog, DiceManagementDialog):
+                labels.extend([dialog.windowTitle(), dialog.preset.itemText(0), dialog.preset.itemText(1)])
+                compact_height = dialog.height()
+                outcomes.append(dialog.custom_panel.isHidden())
+                dialog.preset.setCurrentIndex(1)
+                QApplication.processEvents()
+                outcomes.append(dialog.custom_panel.isVisible() and dialog.height() > compact_height)
+                dialog.critical_max.setValue(95)
+                dialog.accept()
+                outcomes.append(dialog.isVisible() and dialog.feedback.isVisible())
+                dialog.preset.setCurrentIndex(0)
+                QApplication.processEvents()
+                outcomes.append(dialog.custom_panel.isHidden() and dialog.feedback.isHidden()
+                                and dialog.height() == compact_height)
+                dialog.preset.setCurrentIndex(1)
+                dialog.critical_max.setValue(5)
+                dialog.fumble_min.setValue(94)
+                dialog.accept()
+
+        QTimer.singleShot(0, edit_dice_settings)
+        self.window.dice_management_button.click()
+        self.assertEqual(labels, ["掷骰管理", "COC7 原版", "村规"])
+        self.assertEqual(outcomes, [True, True, True, True])
+        config = local_dice_config(self.directory)
+        self.assertEqual((config.custom, config.critical_max, config.fumble_min), (True, 5, 94))
+
+        self.start()
+        self.window.message_input.setPlainText(".rh 1d1")
+        QTest.keyClick(self.window.message_input, Qt.Key.Key_Return)
+        self.wait(lambda: "骰子\n【暗骰】" in self.window.messages.toPlainText() and self.window._pending_send is None)
+        self.assertIn("1D1 [1] = 1", self.window.messages.toPlainText())
+        self.assertEqual(self.window.messages.newest_public_sequence, 0)
 
     def test_group_buttons_parallel_client_channels_metadata_and_complete_history(self):
         member = add_ready_player(self.directory, "调查员")

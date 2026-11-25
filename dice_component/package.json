@@ -1,0 +1,6 @@
+{
+  "name": "story-dice-engine",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "dependencies": { "bcdice": "4.10.0" }
+}

@@ -28,7 +28,7 @@ from chat_protocol import (
 from .auth import AuthError, AuthService, MemberSession
 from .auth_routes import bearer_token
 from .channels import get_channel_access, player_channel_state
-from .messages import ChatSendError, lobby_history, save_lobby_message
+from .messages import ChatSendError, chat_event, lobby_history, submit_lobby_message
 from .storage import open_campaign
 
 router = APIRouter()
@@ -208,21 +208,39 @@ class Lobby:
         assert self.auth is not None
         if channel_id is not None and not isinstance(channel_id, str):
             raise ChatSendError("channel_forbidden")
-        record, created = await run_in_threadpool(
-            save_lobby_message, self.auth.directory, request_id, text, token=token, channel_id=channel_id,
+        submission = await run_in_threadpool(
+            submit_lobby_message, self.auth.directory, request_id, text, token=token, channel_id=channel_id,
         )
-        event = {"type": CHAT_MESSAGE, **record}
-        del event["request_id"]
+        if submission.private:
+            # 私有记录只经本地主持事件回调，永远不进入 WebSocket 广播。
+            assert sender is None and token is None and submission.result is not None
+            if self.on_message is not None:
+                self.on_message(chat_event(submission.message, local=True))
+                self.on_message(chat_event(submission.result, local=True))
+            return chat_event(submission.message, local=True)
+
+        event = chat_event(submission.message)
+        local_event = chat_event(submission.message, local=True)
         if sender is not None and not legacy_send:
+            ack = {"type": CHAT_ACK, "request_id": request_id, "message": event}
+            if not submission.created and submission.result is not None:
+                ack["result"] = chat_event(submission.result)
             try:
-                await sender.send_json({"type": CHAT_ACK, "request_id": request_id, "message": event})
+                await sender.send_json(ack)
             except (WebSocketDisconnect, RuntimeError, OSError):
                 self._remove_connection(sender)
-        if created:
-            await self.broadcast_message(event, own_for=sender if legacy_send else None)
-        return event
+        if submission.created:
+            await self.broadcast_message(event, own_for=sender if legacy_send else None, local_event=local_event)
+            if submission.result is not None:
+                await self.broadcast_message(
+                    chat_event(submission.result), local_event=chat_event(submission.result, local=True),
+                )
+        elif sender is None and submission.result is not None and self.on_message is not None:
+            self.on_message(chat_event(submission.result, local=True))
+        return local_event if sender is None else event
 
-    async def broadcast_message(self, event: dict[str, object], *, own_for: WebSocket | None = None) -> None:
+    async def broadcast_message(self, event: dict[str, object], *, own_for: WebSocket | None = None,
+                                local_event: dict[str, object] | None = None) -> None:
         payload = json.dumps(event)
         sender_payload = json.dumps({**event, "own": True})
         for websocket, client in tuple(self.connections.items()):
@@ -239,7 +257,7 @@ class Lobby:
             except (WebSocketDisconnect, RuntimeError, OSError):
                 self._remove_connection(websocket)
         if self.on_message is not None:
-            self.on_message(event)
+            self.on_message(local_event if local_event is not None else event)
 
     def _message_visible(self, client: AuthenticatedConnection, event: dict) -> bool:
         with open_campaign(self.auth.directory) as connection:

@@ -20,7 +20,7 @@ def has_attributes(connection: sqlite3.Connection, member_id: str) -> bool:
     ).fetchone() is not None
 
 
-def _read(connection: sqlite3.Connection, actor_id: str, ruleset: str) -> dict | None:
+def read_actor_attributes(connection: sqlite3.Connection, actor_id: str, ruleset: str) -> dict | None:
     row = connection.execute(
         "SELECT values_json FROM actor_attributes WHERE actor_id = ? AND ruleset = ?", (actor_id, ruleset),
     ).fetchone()
@@ -38,7 +38,7 @@ def player_attributes(directory: Path, token: str, *, text: str | None = None) -
         ).fetchone()[0]
         if ruleset != "coc7":
             raise AuthError("attributes_ruleset", "当前只支持 CoC7 属性导入。", 400)
-        values = _read(connection, session.actor_id, ruleset)
+        values = read_actor_attributes(connection, session.actor_id, ruleset)
         if text is not None:
             if values is not None:
                 raise AuthError("attributes_exist", "角色已有属性。如需重新导入，请由 KP 重置。", 409)
@@ -70,7 +70,7 @@ def _local_actor(connection: sqlite3.Connection, member_id: str) -> sqlite3.Row:
 def local_attributes(directory: Path, member_id: str) -> dict:
     with open_campaign(directory) as connection:
         actor = _local_actor(connection, member_id)
-        return {"actor_name": actor["name"], "attributes": _read(connection, actor["id"], actor["ruleset"])}
+        return {"actor_name": actor["name"], "attributes": read_actor_attributes(connection, actor["id"], actor["ruleset"])}
 
 
 def reset_local_attributes(directory: Path, member_id: str) -> None:

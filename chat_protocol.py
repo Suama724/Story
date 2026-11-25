@@ -28,6 +28,16 @@ SEND_ERRORS = {
     "channel_forbidden": "你无权在这个频道发言。",
     "attributes_required": "请先在「个人属性」中导入角色属性，再发言。",
     "channel_read_forbidden": "你无权查看这个频道。",
+    "dice_syntax": "掷骰格式不正确。示例：.r 2d6+3、.ra b 困难侦查、.rah 侦查 @角色名。",
+    "dice_limit": "一次最多掷 100 颗骰，奖惩骰支持 1 或 2 颗。",
+    "dice_engine_unavailable": "主机的骰核暂不可用，请联系组织者检查骰核运行环境。",
+    "dice_secret_forbidden": "只有 KP 可以使用暗骰。",
+    "dice_delegate_forbidden": "只有 KP 可以代骰或手动指定检定值。",
+    "dice_role_forbidden": "只有玩家角色和 KP 可以使用骰子。",
+    "dice_check_missing": "找不到用于检定的角色或属性。请核对角色名及人物卡。",
+    "dice_actor_missing": "找不到指定的玩家角色，请核对角色名。",
+    "dice_card_missing": "用于检定的角色还没有人物卡。KP 可用 .ra 60 @角色名 手动指定数值。",
+    "dice_attribute_missing": "人物卡上没有这项属性或技能，请核对指令中的名称。",
 }
 
 

@@ -2,6 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $uv = (Get-Command uv -CommandType Application).Source
+$node = (Get-Command node -CommandType Application | Select-Object -First 1).Source
+$npm = (Get-Command npm.cmd -CommandType Application | Select-Object -First 1).Source
 $originalPath = $env:Path
 Push-Location -LiteralPath $projectRoot
 try {
@@ -18,6 +20,23 @@ try {
         throw "Move the campaign data out of dist/Story/data before rebuilding."
     }
 
+    $nodeVersion = & $node -p "process.versions.node"
+    if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^\d+\.\d+\.\d+$' -or [int]($nodeVersion.Split('.')[0]) -lt 22) {
+        throw "Building Story requires Node.js 22 or later."
+    }
+    & $npm ci --prefix dice_component --omit=dev --ignore-scripts --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installing the dice engine failed."
+    }
+    $nodeLicense = Join-Path (Split-Path -Parent $node) "LICENSE"
+    if (-not (Test-Path -LiteralPath $nodeLicense)) {
+        New-Item -ItemType Directory -Path build -Force | Out-Null
+        $nodeLicense = "build/node-$nodeVersion-LICENSE.txt"
+        if (-not (Test-Path -LiteralPath $nodeLicense)) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nodejs/node/v$nodeVersion/LICENSE" -OutFile $nodeLicense
+        }
+    }
+
     $buildOptions = @(
         "--onedir"
         "--windowed"
@@ -30,6 +49,8 @@ try {
         "--workpath", "build/windows-client"
         "--distpath", "dist"
         "--add-data", "$projectRoot/assets/icons/phosphor;assets/icons/phosphor"
+        "--add-data", "$projectRoot/dice_component/worker.cjs;dice_component"
+        "--add-data", "$projectRoot/dice_component/node_modules;dice_component/node_modules"
         "client/__main__.py"
     )
     # Restrict dependency discovery to Windows and the project environment.
@@ -38,6 +59,9 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE."
     }
+
+    Copy-Item -LiteralPath $node -Destination "dist/Story/_internal/dice_component/node.exe"
+    Copy-Item -LiteralPath $nodeLicense -Destination "dist/Story/_internal/dice_component/NODE-LICENSE.txt"
 
     $archive = "dist/Story-Windows.zip"
     Compress-Archive -LiteralPath "dist/Story" -DestinationPath $archive -Force

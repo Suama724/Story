@@ -33,6 +33,8 @@ from client.window_title_bar import BAR_HEIGHT, window_layout
 
 from .management import add_member, campaign_details, edit_member
 from .attributes import local_attributes, reset_local_attributes
+from .dice import local_dice_config, save_local_dice_config
+from .dice_dialog import DiceManagementDialog
 from .campaign_library import CampaignLibrary
 from .campaign_dialogs import CampaignManagementDialog, add_campaign_card
 from .channels import execute_channel_operation, local_channel_state, mark_channel_read
@@ -366,6 +368,9 @@ class HostWindow(QMainWindow):
         self.channel_choice.currentIndexChanged.connect(self._select_host_channel)
         self.channel_choice.createRequested.connect(self._create_scene)
         left.addWidget(self.channel_choice, 1)
+        self.dice_management_button = QPushButton("掷骰管理")
+        self.dice_management_button.clicked.connect(self._open_dice_management)
+        left.addWidget(self.dice_management_button)
         self.participants_button = QPushButton("参与者管理")
         self.participants_button.clicked.connect(self._open_participants)
         left.addWidget(self.participants_button)
@@ -486,6 +491,26 @@ class HostWindow(QMainWindow):
 
     def _open_participants(self) -> None:
         self._show_dialog(self.participants_dialog)
+
+    def _open_dice_management(self) -> None:
+        if self.campaign is None:
+            return
+        directory = self.campaign["directory"]
+        try:
+            config = local_dice_config(directory)
+        except (sqlite3.Error, OSError, ValueError) as error:
+            self._report_error(str(error))
+            return
+
+        def save(updated) -> None:
+            try:
+                save_local_dice_config(directory, updated)
+            except sqlite3.Error as error:
+                raise ValueError("无法保存骰娘设置，请稍后重试。") from error
+
+        dialog = DiceManagementDialog(self, config, save)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _open_logs(self) -> None:
         self._show_dialog(self.runtime_log_dialog)
@@ -767,7 +792,7 @@ class HostWindow(QMainWindow):
     def _queue_current_read(self, *_args: object) -> None:
         if self.campaign is None:
             return
-        sequence = self.messages.newest_sequence
+        sequence = self.messages.newest_public_sequence
         known = self._channels.get(self._channel_id, {}).get("read_sequence", 0)
         if sequence > max(known, self._pending_reads.get(self._channel_id, 0)):
             self._pending_reads[self._channel_id] = sequence
@@ -1142,6 +1167,7 @@ class HostWindow(QMainWindow):
             dialog.history.set_pagination(dialog.has_more, loading=not available)
         self.network_status.setEnabled(self.campaign is not None and not self._closing)
         self.participants_button.setEnabled(self.campaign is not None and not self._closing)
+        self.dice_management_button.setEnabled(self.campaign is not None and not self._closing)
         self.logs_button.setEnabled(self.campaign is not None and not self._closing)
 
     def closeEvent(self, event: QCloseEvent) -> None:

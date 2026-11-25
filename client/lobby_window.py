@@ -898,6 +898,8 @@ class LobbyWindow(QWidget):
             if self._matches_pending(event) and isinstance(message, dict):
                 self._confirm_send()
                 self._show_live_message(message)
+                if isinstance(event.get("result"), dict):
+                    self._show_live_message(event["result"])
         elif event_type == CHAT_MESSAGE:
             self._show_live_message(event)
             if "message_id" not in event and event.get("own") is True and self._awaiting_send:
