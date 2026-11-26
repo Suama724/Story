@@ -132,4 +132,4 @@ class ServerController(QObject):
         self._set_state("stopped")
         self.logReceived.emit("监听已停止")
         if exit_code != 0 and not stopping and not self._reported_error:
-            self.errorOccurred.emit(f"监听进程已退出，退出码 {exit_code}。请查看运行日志。")
+            self.errorOccurred.emit(f"监听进程已退出，退出码 {exit_code}。请查看服务器日志。")

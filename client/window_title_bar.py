@@ -19,7 +19,7 @@ FRAME_COLOR = "#b6b6b6"
 RESIZE_BORDER = 5
 RESIZE_CORNER = 12
 STYLE = f"""
-QFrame#storyTitleBar {{ background: {BACKGROUND}; border-bottom: 1px solid {BORDER}; }}
+QFrame#storyTitleBar {{ background: {BACKGROUND}; }}
 QLabel#windowCaption {{ color: {TEXT}; font-size: 13px; font-weight: 600; }}
 QLabel#windowIdentity {{ color: {MUTED}; font-size: 13px; }}
 QToolButton#windowControl {{
@@ -29,6 +29,7 @@ QToolButton#windowControl:hover {{ background: {HOVER}; }}
 QToolButton#windowControl:pressed {{ background: {SELECTION}; }}
 QToolButton#windowControl:focus {{ border-color: {FOCUS}; }}
 """
+DIVIDER_STYLE = f"QFrame#storyTitleBar {{ border-bottom: 1px solid {BORDER}; }}"
 LEFT, RIGHT, TOP, BOTTOM = Qt.Edge.LeftEdge, Qt.Edge.RightEdge, Qt.Edge.TopEdge, Qt.Edge.BottomEdge
 RESIZE_CURSORS = {
     LEFT: Qt.CursorShape.SizeHorCursor, RIGHT: Qt.CursorShape.SizeHorCursor,
@@ -169,7 +170,7 @@ class WindowTitleBar(QFrame):
         self._press = None
         self._drag_offset = None
         self.setObjectName("storyTitleBar")
-        self.setStyleSheet(STYLE)
+        self.set_divider_visible(True)
         self.setFixedHeight(BAR_HEIGHT)
         window.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -216,6 +217,9 @@ class WindowTitleBar(QFrame):
         self.separator.setVisible(bool(identity))
         self.identity.setVisible(bool(identity))
         self._window.setWindowTitle(f"{caption} · {identity}" if identity else caption)
+
+    def set_divider_visible(self, visible: bool) -> None:
+        self.setStyleSheet(STYLE + (DIVIDER_STYLE if visible else ""))
 
     def _toggle_maximized(self) -> None:
         if self._window.isMaximized():

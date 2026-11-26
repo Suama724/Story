@@ -14,7 +14,7 @@ from dice_component import RuleConfig
 class DiceManagementDialog(QDialog):
     def __init__(self, parent, config: RuleConfig, save: Callable[[RuleConfig], None]):
         super().__init__(parent)
-        self.setWindowTitle("掷骰管理")
+        self.setWindowTitle("骰子")
         self.setMinimumWidth(470)
         self.save = save
         layout = QVBoxLayout(self)

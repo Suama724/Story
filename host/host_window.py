@@ -20,15 +20,17 @@ from PySide6.QtWidgets import (
 from chat_protocol import chat_text_error
 from client.attribute_dialogs import AttributeSheetDialog
 from client.channel_header import ChannelHeader
+from client.channel_sidebar import ICON_SIZE, ChannelSidebar
 from client.chat_composer import ChatComposer
 from client.chat_history import ChatHistory
 from client.channel_tree import ChannelTree
 from client.player_window import identity_list
+from client.ui_icons import phosphor_icon, svg_icon
 from client.ui_style import (
     BACKGROUND, BORDER, BUTTON_STYLE, CHANNEL_NAV_STYLE, DANGER, FOCUS, ICON_ROOT, MUTED, SELECTION, SIDEBAR,
     SLIM_SCROLLBAR_STYLE, SURFACE, TEXT, apply_theme,
 )
-from client.ui_widgets import ElidedButton, split_channel_view
+from client.ui_widgets import split_channel_view
 from client.window_title_bar import BAR_HEIGHT, window_layout
 
 from .management import add_member, campaign_details, edit_member
@@ -70,7 +72,6 @@ QHeaderView::section {{ background: {SIDEBAR}; color: {MUTED}; padding: 7px; bor
 QTabWidget::pane {{ border: none; }}
 QTabBar::tab {{ padding: 9px 18px; background: {BACKGROUND}; color: {MUTED}; }}
 QTabBar::tab:selected {{ background: {SURFACE}; color: {TEXT}; border-top: 2px solid {FOCUS}; }}
-QWidget#lobbyPage {{ background: {SURFACE}; }}
 """
 
 
@@ -355,47 +356,18 @@ class HostWindow(QMainWindow):
 
     def _build_lobby(self) -> QWidget:
         page = QWidget()
-        page.setObjectName("lobbyPage")
+        page.setObjectName("channelWorkspace")
+        page.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         columns = QHBoxLayout(page)
         columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(0)
-        sidebar = QFrame()
-        sidebar.setObjectName("lobbySidebar")
-        left = QVBoxLayout(sidebar)
-        left.setContentsMargins(16, 16, 16, 16)
-        left.setSpacing(12)
-        self.network_status = ElidedButton("连接状态 · 关闭")
-        self.network_status.clicked.connect(self._open_connection)
-        left.addWidget(self.network_status)
-        left.addSpacing(16)
-        self.create_group_button = QPushButton("新建频道组")
-        self.create_group_button.clicked.connect(self._create_group)
-        left.addWidget(self.create_group_button)
-        self.channel_management_button = QPushButton("频道管理")
-        self.channel_management_button.clicked.connect(self._open_channel_management)
-        left.addWidget(self.channel_management_button)
-        self.channel_choice = ChannelTree()
-        self.channel_choice.currentIndexChanged.connect(self._select_host_channel)
-        self.channel_choice.createRequested.connect(self._create_scene)
-        left.addWidget(self.channel_choice, 1)
-        self.dice_management_button = QPushButton("掷骰管理")
-        self.dice_management_button.clicked.connect(self._open_dice_management)
-        left.addWidget(self.dice_management_button)
-        self.participants_button = QPushButton("参与者管理")
-        self.participants_button.clicked.connect(self._open_participants)
-        left.addWidget(self.participants_button)
-        self.logs_button = QPushButton("日志")
-        self.logs_button.clicked.connect(self._open_logs)
-        left.addWidget(self.logs_button)
-        self.network_button = QPushButton("开启监听")
-        self.network_button.setObjectName("primary")
-        self.network_button.clicked.connect(self._toggle_network)
-        left.addWidget(self.network_button)
-        chat_panel = QWidget()
+        self._sidebar = self._build_sidebar(page)
+        chat_panel = QFrame()
+        chat_panel.setObjectName("channelChatPanel")
         right = QVBoxLayout(chat_panel)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
-        self.channel_header = ChannelHeader(can_archive=True)
+        self.channel_header = ChannelHeader(can_archive=True, divider=False)
         self.channel_title = self.channel_header.title
         self.channel_info_button = self.channel_header.description_button
         self.channel_info_button.clicked.connect(self._open_channel_info)
@@ -406,7 +378,7 @@ class HostWindow(QMainWindow):
         self.archive_scene_button = self.channel_header.archive_button
         self.archive_scene_button.clicked.connect(self._archive_scene)
         right.addWidget(self.channel_header)
-        self.messages = ChatHistory(conversation=True)
+        self.messages = ChatHistory(conversation=True, fade_top=True)
         self.messages.olderRequested.connect(self._load_older_history)
         self.messages.setPlaceholderText("暂无消息")
         self.server.messageReceived.connect(self._receive_message)
@@ -414,11 +386,12 @@ class HostWindow(QMainWindow):
         self.message_input = ChatComposer()
         self.message_input.setPlaceholderText("以 KP 身份发言")
         self.message_input.sendRequested.connect(self._send_message)
-        composer = QVBoxLayout()
-        composer.setContentsMargins(12, 2, 12, 12)
-        composer.addWidget(self.message_input)
-        right.addLayout(composer)
-        self.channel_splitter = split_channel_view(sidebar, chat_panel)
+        self._composer_layout = QVBoxLayout()
+        self._composer_layout.setContentsMargins(12, 2, 12, 12)
+        self._composer_layout.setSpacing(6)
+        self._composer_layout.addWidget(self.message_input)
+        right.addLayout(self._composer_layout)
+        self.channel_splitter = split_channel_view(self._sidebar, chat_panel)
         columns.addWidget(self.channel_splitter)
 
         self.connection_dialog = ConnectionDialog(self)
@@ -443,6 +416,44 @@ class HostWindow(QMainWindow):
         self._history_dialogs = {}
         self._members_dialogs = {}
         return page
+
+    def _build_sidebar(self, page: QWidget) -> ChannelSidebar:
+        self.channel_choice = ChannelTree()
+        self.channel_choice.currentIndexChanged.connect(self._select_host_channel)
+        self.channel_choice.createRequested.connect(self._create_scene)
+        sidebar = ChannelSidebar(self.channel_choice, page)
+
+        self.network_status = sidebar.action("连接配置", phosphor_icon("bold/gear-six-bold.svg", size=ICON_SIZE))
+        self.network_status.clicked.connect(self._open_connection)
+        sidebar.actions.addWidget(self.network_status)
+        sidebar.actions.addStretch()
+
+        dice_svg = (ICON_ROOT.parent / "story" / "dice-d20.svg").read_bytes()
+        self.dice_management_button = sidebar.action("骰子", svg_icon(dice_svg, size=ICON_SIZE))
+        self.dice_management_button.clicked.connect(self._open_dice_management)
+        self.participants_button = sidebar.action("参与者管理", phosphor_icon("bold/users-bold.svg", size=ICON_SIZE))
+        self.participants_button.clicked.connect(self._open_participants)
+        self.logs_button = sidebar.action("服务器日志", phosphor_icon("bold/clock-counter-clockwise-bold.svg", size=ICON_SIZE))
+        self.logs_button.clicked.connect(self._open_logs)
+        self.network_button = sidebar.connection_button
+        sidebar.set_connection_state(False, "开启监听", "服务器未开启")
+        self.network_button.clicked.connect(self._toggle_network)
+        for widget in (self.dice_management_button, self.participants_button, self.logs_button,
+                       sidebar.avatar_placeholder(), self.network_button):
+            sidebar.actions.addWidget(widget)
+
+        self.create_group_button = sidebar.action("新建频道组", phosphor_icon("bold/plus-bold.svg", size=ICON_SIZE))
+        self.create_group_button.clicked.connect(self._create_group)
+        self.channel_management_button = sidebar.action("频道管理", phosphor_icon("bold/folder-simple-bold.svg", size=ICON_SIZE))
+        self.channel_management_button.clicked.connect(self._open_channel_management)
+        channel_tools = QHBoxLayout()
+        channel_tools.setContentsMargins(8, 2, 0, 0)
+        channel_tools.setSpacing(3)
+        channel_tools.addWidget(self.create_group_button)
+        channel_tools.addWidget(self.channel_management_button)
+        channel_tools.addStretch()
+        sidebar.navigation.insertLayout(0, channel_tools)
+        return sidebar
 
     def _run(self, operation: Callable, on_result: Callable) -> None:
         if self._busy:
@@ -717,6 +728,10 @@ class HostWindow(QMainWindow):
         self.message_input.clear()
         self.pages.setCurrentIndex(1)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(0)
+        self._content_layout.removeWidget(self.feedback)
+        self._composer_layout.insertWidget(0, self.feedback)
+        self.title_bar.set_divider_visible(False)
         self.title_bar.set_caption(str(campaign["name"]), "KP")
         self._populate_members()
         self._update_channel_windows()
@@ -1041,10 +1056,14 @@ class HostWindow(QMainWindow):
             self.server.start(self.campaign["directory"], host, self.listen_port.value())
 
     def _network_state(self, state: str) -> None:
-        states = {"stopped": "关闭", "starting": "开启中…", "running": "开启", "stopping": "关闭中…"}
-        self.network_status.setText(f"连接状态 · {states[state]}")
-        self.connection_dialog.status.setText(f"连接状态：{states[state]}")
-        self.network_button.setText("开启监听" if state == "stopped" else "关闭监听")
+        action, status = {
+            "stopped": ("开启监听", "服务器未开启"),
+            "starting": ("正在开启监听", "服务器正在开启…"),
+            "running": ("关闭监听", "服务器已开启"),
+            "stopping": ("正在关闭监听", "服务器正在关闭…"),
+        }[state]
+        self._sidebar.set_connection_state(state == "running", action, status)
+        self.connection_dialog.status.setText(status)
         if state == "running":
             self.server.command("channels")
         if state == "stopped":
@@ -1129,6 +1148,10 @@ class HostWindow(QMainWindow):
         self._pending_reads.clear()
         self._channel_refresh_timer.stop()
         self.pages.setCurrentIndex(0)
+        self._composer_layout.removeWidget(self.feedback)
+        self._content_layout.addWidget(self.feedback)
+        self._content_layout.setSpacing(16)
+        self.title_bar.set_divider_visible(True)
         self.title_bar.set_caption("组织者登录")
         self.setMinimumSize(680, 360 + BAR_HEIGHT)
         self.centralWidget().layout().activate()

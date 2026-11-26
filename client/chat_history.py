@@ -13,6 +13,7 @@ from .ui_style import DISABLED, MUTED, SELECTION, SIDEBAR, SLIM_SCROLLBAR_STYLE,
 
 AVATAR_SIZE = 34
 FADE_HEIGHT = 12
+TOP_FADE_HEIGHT = 22
 CONVERSATION_STYLE = f"""
 QTextEdit#conversationHistory {{
     color: {TEXT}; background: {SURFACE}; border: none; padding: 0;
@@ -28,16 +29,18 @@ class _Message(NamedTuple):
 
 
 class _HistoryFade(QWidget):
-    def __init__(self, parent: QWidget) -> None:
+    def __init__(self, parent: QWidget, *, at_top: bool = False) -> None:
         super().__init__(parent)
+        self._at_top = at_top
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
     def paintEvent(self, event) -> None:
-        gradient = QLinearGradient(0, 0, 0, self.height())
+        start, end = (self.height(), 0) if self._at_top else (0, self.height())
+        gradient = QLinearGradient(0, start, 0, end)
         color = QColor(SURFACE)
         color.setAlpha(0)
         gradient.setColorAt(0, color)
-        color.setAlpha(230)
+        color.setAlpha(255 if self._at_top else 230)
         gradient.setColorAt(1, color)
         painter = QPainter(self)
         painter.fillRect(self.rect(), gradient)
@@ -46,7 +49,7 @@ class _HistoryFade(QWidget):
 class ChatHistory(QTextEdit):
     olderRequested = Signal()
 
-    def __init__(self, *, conversation: bool = False) -> None:
+    def __init__(self, *, conversation: bool = False, fade_top: bool = False) -> None:
         super().__init__()
         self.setReadOnly(True)
         self.setUndoRedoEnabled(False)
@@ -59,11 +62,15 @@ class ChatHistory(QTextEdit):
         self.history_loading = False
         self._updating = False
         self._conversation = conversation
+        self._top_fade = None
         self._block_style = QTextBlockFormat()
         self._name_style = QTextCharFormat()
         self._body_style = QTextCharFormat()
         if conversation:
             self._fade = _HistoryFade(self)
+            if fade_top:
+                self._top_fade = _HistoryFade(self, at_top=True)
+                self._top_fade.hide()
             self._avatar = phosphor_icon("bold/user-circle-bold.svg", DISABLED, size=AVATAR_SIZE).pixmap(
                 QSize(AVATAR_SIZE, AVATAR_SIZE), 2,
             )
@@ -102,6 +109,8 @@ class ChatHistory(QTextEdit):
             self.olderRequested.emit()
 
     def _scrolled(self, value: int) -> None:
+        if self._top_fade is not None:
+            self._top_fade.setVisible(value > self.verticalScrollBar().minimum())
         if value <= self.verticalScrollBar().minimum() + 2:
             self.request_older()
 
@@ -131,6 +140,9 @@ class ChatHistory(QTextEdit):
             viewport = self.viewport().geometry()
             self._fade.setGeometry(viewport.x(), viewport.bottom() - FADE_HEIGHT + 1, viewport.width(), FADE_HEIGHT)
             self._fade.raise_()
+            if self._top_fade is not None:
+                self._top_fade.setGeometry(viewport.x(), viewport.y(), viewport.width(), TOP_FADE_HEIGHT)
+                self._top_fade.raise_()
         if follow:
             bar.setValue(bar.maximum())
 

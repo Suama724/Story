@@ -365,8 +365,23 @@ class PlayerWindow(QWidget):
     def _request(self, operation: str, body: dict | None = None) -> None:
         self._busy = True
         self.feedback.setText("正在等待主机响应…")
+        if operation == "login" and self.lobby is not None:
+            self.lobby.set_offline_login_pending(True)
+            self.lobby.feedback.setText(self.feedback.text())
         self._update_controls()
         self.auth.request(self._http, operation, body, self.session.token if self.session else "")
+
+    def _finish_auth_request(self, operation: str) -> None:
+        self._busy = False
+        if operation == "login" and self.lobby is not None:
+            self.lobby.set_offline_login_pending(False)
+            self.lobby.feedback.clear()
+
+    def _show_login_error(self, message: str) -> None:
+        self.feedback.setText(message)
+        if self.lobby is not None:
+            self.lobby.feedback.setText(message)
+        self._update_controls()
 
     def _change_password(self) -> None:
         if self._busy or not self.change_button.isEnabled():
@@ -386,7 +401,7 @@ class PlayerWindow(QWidget):
         })
 
     def _auth_completed(self, operation: str, response: dict) -> None:
-        self._busy = False
+        self._finish_auth_request(operation)
         self.feedback.setText("")
         if operation == "login":
             try:
@@ -395,15 +410,13 @@ class PlayerWindow(QWidget):
                 if session.role != expected_role:
                     raise ValueError(LOGIN_ERRORS["role_mismatch"])
             except ValueError as error:
-                self.feedback.setText(str(error))
-                self._update_controls()
+                self._show_login_error(str(error))
                 return
             if self._offline_record is not None:
                 identity = self._lobby_identity()
                 if identity is not None and (session.campaign_id, session.member_id) != identity:
-                    self.feedback.setText("主机上的团或角色已变更，请关闭窗口后重新选择身份。")
                     self.password.clear()
-                    self._update_controls()
+                    self._show_login_error("主机上的团或角色已变更，请关闭窗口后重新选择身份。")
                     return
             self.session = session
             self._current_password = self.password.text()
@@ -438,7 +451,7 @@ class PlayerWindow(QWidget):
     def _auth_failed(self, operation: str, code: str, message: str) -> None:
         if operation == "password":
             self.personal_info_dialog.set_feedback(message)
-        self._busy = False
+        self._finish_auth_request(operation)
         self._pending_password = ""
         if operation == "login":
             self._login_failed(code, message)
@@ -504,6 +517,7 @@ class PlayerWindow(QWidget):
         self.lobby.attributesStatusChanged.connect(self._attributes_status_changed)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
         self._content_layout.setSpacing(0)
+        self.title_bar.set_divider_visible(False)
         self.pages.addWidget(self.lobby)
         self.pages.setCurrentWidget(self.lobby)
         self._show_lobby_identity(campaign_name, actor_name)
@@ -550,6 +564,7 @@ class PlayerWindow(QWidget):
             self.lobby = None
             self._content_layout.setContentsMargins(22, 20, 22, 18)
             self._content_layout.setSpacing(12)
+            self.title_bar.set_divider_visible(True)
             self.setMinimumSize(self._login_minimum_size)
             if self._login_geometry is not None:
                 self.layout().activate()
@@ -677,7 +692,10 @@ class PlayerWindow(QWidget):
         self._update_personal_info()
 
     def _attributes_status_changed(self) -> None:
-        if self.lobby.attributes_imported is False and self._attribute_sheet is not None:
+        lobby = self.lobby
+        if lobby is None or self.sender() is not lobby:
+            return
+        if lobby.attributes_imported is False and self._attribute_sheet is not None:
             self._attribute_sheet.close()
             self.personal_info_dialog.set_feedback("KP 已重置角色属性，请重新导入。")
         self._update_personal_info()

@@ -11,7 +11,7 @@ from .auth_client import server_urls
 class HostMonitor(QObject):
     changed = Signal(object)
 
-    def __init__(self, address, campaign_id, parent=None):
+    def __init__(self, address: str, campaign_id: str | None, parent=None):
         super().__init__(parent)
         self.base, _ = server_urls(address)
         self.campaign_id = campaign_id
@@ -53,7 +53,9 @@ class HostMonitor(QObject):
             try:
                 payload = json.loads(bytes(reply.readAll()))
                 if isinstance(payload, dict) and isinstance(payload.get("running"), bool):
-                    state = payload["running"] and payload.get("campaign_id") == self.campaign_id
+                    state = payload["running"] and (
+                        self.campaign_id is None or payload.get("campaign_id") == self.campaign_id
+                    )
             except (ValueError, UnicodeError):
                 pass
         elif reply.error() == QNetworkReply.NetworkError.ConnectionRefusedError:

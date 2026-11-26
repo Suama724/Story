@@ -9,14 +9,16 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QSettings, QTimer, Qt
+from PySide6.QtCore import QEvent, QPoint, QSettings, QTimer, Qt
+from PySide6.QtGui import QHelpEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget
 
 from client.chat_composer import ChatComposer
 from client.chat_history import ChatHistory
 from client.lobby_window import LobbyWindow
 from client.player_window import PasswordDialog, PlayerWindow
+from client.ui_style import BACKGROUND, SURFACE
 from host.channels import create_channel_group, create_scene
 from host.management import add_member
 from host.messages import save_lobby_message
@@ -102,6 +104,49 @@ class ScrollHistoryTests(unittest.TestCase):
 
 
 class ChannelNavigationTests(unittest.TestCase):
+    def test_participant_lobby_surfaces_and_scrolled_message_fade(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            player = PlayerWindow(QSettings(str(Path(folder) / "player.ini"), QSettings.Format.IniFormat))
+            player.show()
+            try:
+                player._open_local_history({"address": "ws://127.0.0.1:1/ws/lobby", "actor_name": "调查员",
+                                            "campaign_name": "调查团", "campaign_id": "test", "member_id": "actor"})
+                app.processEvents()
+                lobby = player.lobby
+                panel = lobby.channel_splitter.widget(1)
+                title_edge = player.title_bar.mapTo(player, QPoint(20, player.title_bar.height() - 1))
+
+                def pixel(image, point):
+                    ratio = image.devicePixelRatio()
+                    return image.pixelColor(int(point.x() * ratio), int(point.y() * ratio)).name()
+
+                image = player.grab().toImage()
+                self.assertEqual(pixel(image, title_edge), BACKGROUND)
+                edge = panel.mapTo(player, QPoint())
+                for y in (1, panel.height() - 2):
+                    self.assertEqual(pixel(image, edge + QPoint(-20, y)), BACKGROUND)
+                    self.assertEqual(pixel(image, edge + QPoint(1, y)), BACKGROUND)
+                    self.assertEqual(pixel(image, edge + QPoint(20, y)), SURFACE)
+                header_edge = lobby.channel_header.mapTo(player, QPoint(20, lobby.channel_header.height() - 1))
+                self.assertEqual(pixel(image, header_edge), SURFACE)
+
+                history = lobby.chat_history
+                self.assertFalse(history._top_fade.isVisible())
+                history.add_messages(ScrollHistoryTests.records(1, 40))
+                bar = history.verticalScrollBar()
+                bar.setValue(bar.maximum() // 2)
+                self.assertTrue(history._top_fade.isVisible())
+                self.assertEqual(history._top_fade.pos(), history.viewport().pos())
+                bar.setValue(bar.minimum())
+                self.assertFalse(history._top_fade.isVisible())
+
+                player._reset_login("")
+                app.processEvents()
+                self.assertNotEqual(pixel(player.grab().toImage(), title_edge), BACKGROUND)
+            finally:
+                player.close()
+
     def test_dragging_resizes_both_panes_and_channel_group_still_expands(self):
         app = QApplication.instance() or QApplication([])
         lobby = LobbyWindow(offline_actor="调查员")
@@ -235,18 +280,36 @@ class ParticipantUiTests(unittest.TestCase):
         self.lobby.channel_choice.setCurrentIndex(self.lobby.channel_choice.findData(channel))
         self.wait(lambda: self.lobby._history_request is None)
 
+    def click_sidebar(self, button, point=None):
+        point = button.rect().center() if point is None else point
+        QTest.mouseClick(self.player.windowHandle(), Qt.MouseButton.LeftButton, pos=button.mapTo(self.player, point))
+
     def test_layout_and_monitor_distinguish_manual_disconnect_from_host_shutdown(self):
         self.player.show()
         self.app.processEvents()
         self.assertFalse(hasattr(self.player, "header"))
         self.assertEqual(self.player.title_bar.caption.text(), "参与者界面团")
-        sidebar = self.lobby.connection_status.parentWidget().layout()
-        self.assertIs(sidebar.itemAt(0).widget(), self.lobby.connection_status)
-        self.assertEqual(self.lobby.channel_choice.findChildren(QPushButton), [])
+        sidebar = self.lobby._sidebar
+        server_status = sidebar.server_status
+        personal = self.lobby.personal_info_button
+        connection = self.lobby.connection_button
+        channels = self.lobby.channel_choice
+        self.assertIsInstance(server_status, QToolButton)
+        self.assertEqual(server_status.text(), "刷新服务器状态")
+        self.assertEqual(channels.findChildren(QToolButton), [])
+        self.assertEqual(channels.findChildren(QPushButton), [])
+        group_row = channels.visualItemRect(channels.topLevelItem(0))
+        server_center = server_status.mapTo(sidebar, server_status.rect().center())
+        group_center = channels.viewport().mapTo(sidebar, group_row.center())
+        self.assertLessEqual(abs(group_center.y() - server_center.y()), 1)
+        self.assertLess(server_center.x(), channels.geometry().left())
+        self.assertLess(personal.geometry().bottom(), connection.geometry().top())
+        self.assertEqual(personal.toolTip(), "个人")
+        self.assertGreater(personal.iconSize().width(), connection.iconSize().width())
+        for button in (server_status, personal, connection):
+            self.assertEqual(button.toolButtonStyle(), Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.assertFalse(button.icon().isNull())
         header = self.lobby.channel_header
-        buttons = {button.text() for button in self.lobby.findChildren(QPushButton)
-                   if button is not header.description_button}
-        self.assertEqual(buttons, {"个人属性", "断开连接"})
         self.assertLessEqual(header.height(), 50)
         self.assertEqual(header.description_button.accessibleName(), "频道简介")
         self.assertLess(header.description_button.geometry().right(), header.members_button.geometry().left())
@@ -254,23 +317,54 @@ class ParticipantUiTests(unittest.TestCase):
             self.assertEqual(button.toolTip(), tooltip)
             self.assertEqual(button.toolButtonStyle(), Qt.ToolButtonStyle.ToolButtonIconOnly)
             self.assertFalse(button.icon().isNull())
-        self.assertEqual(self.lobby.connection_status.text(), "已开启-已连接")
-        self.lobby.connection_button.click()
-        self.wait(lambda: not self.lobby.is_online)
-        self.lobby._host_monitor.check()
-        self.wait(lambda: self.lobby.connection_status.text() == "已开启-未连接")
+        self.assertEqual(server_status.toolTip(), "服务器已开启")
+        self.assertEqual(connection.toolTip(), "本机已连接")
+        running_icon = server_status.icon().cacheKey()
+        connected_icon = connection.icon().cacheKey()
+        point = server_status.rect().center()
+        event = QHelpEvent(QEvent.Type.ToolTip, point, server_status.mapToGlobal(point))
+        QApplication.sendEvent(server_status, event)
+        tooltip = self.lobby.findChild(QLabel, "sidebarTooltip")
+        self.assertTrue(tooltip.isVisible())
+        self.assertEqual(tooltip.text(), "服务器已开启")
+        self.assertGreater(tooltip.x(), server_status.mapTo(self.lobby, server_status.rect().topRight()).x())
+        monitor = self.lobby._host_monitor
+        self.assertTrue(monitor.timer.isActive())
+        self.wait(lambda: monitor.reply is None)
+        self.click_sidebar(server_status)
+        self.assertTrue(tooltip.isVisible())
+        self.assertEqual(tooltip.text(), "正在检查服务器…")
+        request = monitor.reply
+        self.assertIsNotNone(request)
+        server_status.click()
+        self.assertIs(monitor.reply, request)
+        self.wait(lambda: tooltip.text() == "服务器已开启" and monitor.reply is None)
+        self.assertTrue(self.lobby.is_online)
+        self.assertFalse(self.player.personal_info_dialog.isVisible())
+        self.click_sidebar(connection, QPoint(3, connection.height() // 2))
+        self.wait(lambda: connection.toolTip() == "本机未连接")
+        self.assertEqual(server_status.toolTip(), "服务器已开启")
+        self.assertEqual(server_status.icon().cacheKey(), running_icon)
+        disconnected_icon = connection.icon().cacheKey()
+        self.assertNotEqual(disconnected_icon, connected_icon)
         self.assertFalse(self.lobby._reconnect_timer.isActive())
         self.server.stop()
         self.wait(lambda: not self.server.active)
-        self.lobby._host_monitor.check()
-        self.wait(lambda: self.lobby.connection_status.text() == "未开启-未连接")
+        self.wait(lambda: server_status.toolTip() == "服务器未开启")
+        self.assertNotEqual(server_status.icon().cacheKey(), running_icon)
+        self.assertEqual(connection.icon().cacheKey(), disconnected_icon)
+        monitor.timer.stop()
         self.server.start(self.directory, "127.0.0.1", self.port)
         self.wait(lambda: self.server.state == "running")
-        self.lobby._host_monitor.check()
-        self.wait(lambda: self.lobby.connection_status.text() == "已开启-未连接")
-        self.lobby.connection_button.click()
+        self.assertEqual(server_status.toolTip(), "服务器未开启")
+        server_status.setFocus()
+        QTest.keyClick(server_status, Qt.Key.Key_Space)
+        self.wait(lambda: server_status.toolTip() == "服务器已开启")
+        self.assertEqual(connection.toolTip(), "本机未连接")
+        self.click_sidebar(connection)
         self.wait(lambda: self.lobby.is_online)
-        self.assertEqual(self.lobby.connection_status.text(), "已开启-已连接")
+        self.assertEqual(connection.toolTip(), "本机已连接")
+        self.assertEqual(connection.icon().cacheKey(), connected_icon)
 
     def test_main_scroll_and_log_have_independent_paging_and_cached_member_data(self):
         self.select(self.first)
@@ -322,7 +416,8 @@ class ParticipantUiTests(unittest.TestCase):
         reopened = self.login()
         self.assertIsNone(reopened.session)
         self.lobby = reopened.lobby
-        self.wait(lambda: self.lobby.connection_status.text() == "未开启-未连接")
+        self.wait(lambda: self.lobby._sidebar.server_status.toolTip() == "服务器未开启")
+        self.assertEqual(self.lobby.connection_button.toolTip(), "本机未连接")
         self.select(self.first)
         self.lobby._open_channel_log()
         log = self.lobby._log_dialogs[self.first]
@@ -352,7 +447,13 @@ class ParticipantUiTests(unittest.TestCase):
         self.assertLessEqual(log.history.newest_sequence, 125)
 
     def test_personal_info_password_change_updates_display_and_offline_login(self):
-        self.lobby.personal_info_button.click()
+        self.player.show()
+        self.app.processEvents()
+        personal = self.lobby.personal_info_button
+        point = QPoint(2, personal.height() // 2)
+        event = QHelpEvent(QEvent.Type.ToolTip, point, personal.mapToGlobal(point))
+        QApplication.sendEvent(personal, event)
+        self.click_sidebar(personal, point)
         dialog = self.player.personal_info_dialog
         self.assertTrue(dialog.isVisible())
         self.assertEqual((dialog.identity.text(), dialog.name.text(), dialog.password.text()), ("PL", "林舟", "123456"))

@@ -11,12 +11,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QEvent, QPoint, QSettings, QTimer, Qt
+from PySide6.QtGui import QHelpEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QFrame, QLabel, QPushButton
 
 from client.player_window import PlayerWindow
 from client.role_window import RoleWindow
+from client.ui_style import SLIM_SCROLLBAR_STYLE
 from host import migrations
 from host.auth import AuthService
 from host.channels import (
@@ -191,8 +193,47 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         self.window.members_refresh.click()
         self.wait(lambda: not self.window._busy)
         self.window.show()
-        self.window.network_status.click()
+        self.app.processEvents()
+        sidebar = self.window._sidebar
+        rail_buttons = (
+            self.window.network_status, self.window.dice_management_button, self.window.participants_button,
+            self.window.logs_button, self.window.network_button,
+        )
+        self.assertEqual([button.toolTip() for button in rail_buttons],
+                         ["连接配置", "骰子", "参与者管理", "服务器日志", "服务器未开启"])
+        for button in rail_buttons:
+            self.assertEqual(button.toolButtonStyle(), Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.assertFalse(button.icon().isNull())
+            self.assertIs(button.parentWidget(), rail_buttons[0].parentWidget())
+        self.assertIs(sidebar.actions.itemAt(0).widget(), rail_buttons[0])
+        self.assertIs(sidebar.actions.itemAt(sidebar.actions.count() - 1).widget(), rail_buttons[-1])
+        divider = sidebar.findChild(QFrame, "channelSidebarDivider")
+        self.assertGreater(divider.y(), 0)
+        self.assertLess(divider.geometry().bottom(), sidebar.rect().bottom())
+        self.assertEqual(self.window.channel_choice.verticalScrollBar().styleSheet(), SLIM_SCROLLBAR_STYLE)
+
+        avatar = sidebar.findChild(QLabel, "sidebarAvatar")
+        self.assertEqual(sidebar.actions.indexOf(avatar), sidebar.actions.indexOf(self.window.logs_button) + 1)
+        self.assertEqual(sidebar.actions.indexOf(avatar), sidebar.actions.indexOf(self.window.network_button) - 1)
+        self.assertEqual(avatar.focusPolicy(), Qt.FocusPolicy.NoFocus)
+        tooltip = self.window.findChild(QLabel, "sidebarTooltip")
+        point = avatar.rect().center()
+        QApplication.sendEvent(avatar, QHelpEvent(QEvent.Type.ToolTip, point, avatar.mapToGlobal(point)))
+        self.assertTrue(tooltip.isVisible())
+        self.assertEqual(tooltip.text(), "个人")
+        QTest.mouseClick(self.window.windowHandle(), Qt.MouseButton.LeftButton, pos=avatar.mapTo(self.window, point))
+        self.assertFalse(any(dialog.isVisible() for dialog in self.window.findChildren(QDialog)))
+        self.assertEqual(self.window.server.state, "stopped")
+
+        connection = self.window.network_status
+        point = connection.rect().center()
+        QApplication.sendEvent(connection, QHelpEvent(QEvent.Type.ToolTip, point, connection.mapToGlobal(point)))
+        self.assertTrue(tooltip.isVisible())
+        self.assertEqual(tooltip.text(), "连接配置")
+        QTest.mouseClick(self.window.windowHandle(), Qt.MouseButton.LeftButton,
+                         pos=connection.mapTo(self.window, QPoint(3, point.y())))
         self.assertTrue(self.window.connection_dialog.isVisible())
+        self.assertEqual(self.window.connection_dialog.windowTitle(), "连接配置")
         self.assertTrue(self.window.listen_host.isEnabled())
         self.assertFalse(hasattr(self.window, "switch_button"))
         self.assertFalse(hasattr(self.window, "visibility_choice"))
@@ -200,19 +241,35 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         self.window.participants_button.click()
         self.assertTrue(self.window.participants_dialog.isVisible())
         self.assertEqual([self.window.member_table.horizontalHeaderItem(c).text() for c in range(3)], ["身份", "名称", "密码"])
+        previous_icon = self.window.network_button.icon().cacheKey()
         port = self.start()
         self.assertFalse(self.window.listen_host.isEnabled())
+        self.assertEqual(self.window.network_button.toolTip(), "服务器已开启")
+        self.assertNotEqual(self.window.network_button.icon().cacheKey(), previous_icon)
         player = self.login("调查员", port)
+        player_avatar = player.lobby.personal_info_button
+        host_pixmap = avatar.pixmap()
+        player_pixmap = player_avatar.icon().pixmap(player_avatar.iconSize(), host_pixmap.devicePixelRatio())
+        self.assertEqual(host_pixmap.deviceIndependentSize().toSize(), player_avatar.iconSize())
+        host_image, player_image = host_pixmap.toImage(), player_pixmap.toImage()
+        for x, y in ((0, 0), (host_image.width() // 4, host_image.height() // 2),
+                     (host_image.width() // 2, host_image.height() * 3 // 8)):
+            self.assertEqual(host_image.pixelColor(x, y), player_image.pixelColor(x, y))
         self.wait(lambda: member in self.window._online_members)
         self.assertEqual(self.window.connection_dialog.members.item(0, 2).text(), "在线")
         self.window.connection_dialog.close()
         self.assertEqual(self.window.server.state, "running")
         self.window.logs_button.click()
         self.assertTrue(self.window.runtime_log_dialog.isVisible())
+        self.assertEqual(self.window.runtime_log_dialog.windowTitle(), "服务器日志")
         self.assertIn("调查员加入了", self.window.logs.toPlainText())
         player.lobby.connection_button.click()
         self.wait(lambda: member not in self.window._online_members)
         self.assertEqual(self.window.connection_dialog.members.item(0, 2).text(), "离线")
+        self.window.network_button.click()
+        self.wait(lambda: self.window.server.state == "stopped")
+        self.assertEqual(self.window.network_button.toolTip(), "服务器未开启")
+        self.assertEqual(self.window.network_button.icon().cacheKey(), previous_icon)
 
     def test_player_import_and_organizer_reset_update_live_speaking_permission(self):
         member = add_member(self.directory, "调查员")
@@ -296,7 +353,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
         sidebar = self.window.participants_button.parentWidget().layout()
         self.assertEqual(sidebar.indexOf(self.window.dice_management_button) + 1,
                          sidebar.indexOf(self.window.participants_button))
-        self.assertEqual(self.window.dice_management_button.text(), "掷骰管理")
+        self.assertEqual(self.window.dice_management_button.text(), "骰子")
         outcomes = []
         labels = []
 
@@ -323,7 +380,7 @@ class LobbyRedesignGuiTests(unittest.TestCase):
 
         QTimer.singleShot(0, edit_dice_settings)
         self.window.dice_management_button.click()
-        self.assertEqual(labels, ["掷骰管理", "COC7 原版", "村规"])
+        self.assertEqual(labels, ["骰子", "COC7 原版", "村规"])
         self.assertEqual(outcomes, [True, True, True, True])
         config = local_dice_config(self.directory)
         self.assertEqual((config.custom, config.critical_max, config.fumble_min), (True, 5, 94))

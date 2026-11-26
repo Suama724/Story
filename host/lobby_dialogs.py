@@ -33,13 +33,13 @@ def make_table(headers):
 class ConnectionDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("连接状态")
+        self.setWindowTitle("连接配置")
         self.resize(800, 470)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(16)
         row = QHBoxLayout()
-        self.status = text_label("连接状态：关闭")
+        self.status = text_label("服务器未开启")
         row.addWidget(self.status, 1)
         self.listen_host = QLineEdit("127.0.0.1")
         self.listen_host.setAccessibleName("监听地址")
@@ -97,7 +97,7 @@ class ParticipantsDialog(QDialog):
 class RuntimeLogDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("运行日志")
+        self.setWindowTitle("服务器日志")
         self.resize(800, 480)
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)

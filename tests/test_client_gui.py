@@ -509,7 +509,7 @@ class ClientGuiTests(unittest.TestCase):
                 lobby.connect_button.click()
                 self.wait_until(lambda: "自动重连失败" in lobby.feedback.text())
                 self.assertEqual(lobby._retry_count, 2)
-                self.assertTrue(lobby.connection_status.text().endswith("-未连接"))
+                self.assertEqual(lobby.connection_button.toolTip(), "本机未连接")
                 self.assertTrue(lobby.connect_button.isEnabled())
                 self.assertFalse(lobby._reconnect_timer.isActive())
 
@@ -603,12 +603,19 @@ class ClientGuiTests(unittest.TestCase):
         self.login(reopened, DEFAULT_PASSWORD)
         self.assertIsNone(reopened.session)
         lobby = reopened.lobby
-        self.assertTrue(lobby.connection_status.text().endswith("-未连接"))
+        self.assertEqual(lobby.connection_button.toolTip(), "本机未连接")
         self.assertTrue(lobby.message.isReadOnly())
         self.assertFalse(lobby.message.send_available)
         self.assertIn("历史 055", lobby.chat_history.toPlainText())
         lobby.chat_history.request_older()
         self.assertIn("历史 001", lobby.chat_history.toPlainText())
+
+        lobby.connect_button.click()
+        self.assertEqual(lobby.feedback.text(), "正在等待主机响应…")
+        self.assertFalse(lobby.connection_button.isEnabled())
+        self.wait_until(lambda: not reopened._busy)
+        self.assertIn("无法连接主机", lobby.feedback.text())
+        self.assertTrue(lobby.connection_button.isEnabled())
 
         populate(56, 110)
         self.server.start(self.directory, "127.0.0.1", self.port)

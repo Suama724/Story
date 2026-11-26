@@ -49,6 +49,7 @@ try {
         "--workpath", "build/windows-client"
         "--distpath", "dist"
         "--add-data", "$projectRoot/assets/icons/phosphor;assets/icons/phosphor"
+        "--add-data", "$projectRoot/assets/icons/story;assets/icons/story"
         "--add-data", "$projectRoot/dice_component/worker.cjs;dice_component"
         "--add-data", "$projectRoot/dice_component/node_modules;dice_component/node_modules"
         "client/__main__.py"

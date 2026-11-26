@@ -43,15 +43,11 @@ from .chat_composer import ChatComposer
 from .chat_history import ChatHistory
 from .history_cache import HistoryCache, is_saved_message
 from .channel_tree import ChannelTree
-from .ui_style import CHANNEL_NAV_STYLE, STYLE, SURFACE
-from .ui_widgets import ElidedLabel, split_channel_view
+from .participant_sidebar import ParticipantSidebar
+from .ui_style import CHANNEL_NAV_STYLE, STYLE
+from .ui_widgets import split_channel_view
 from .host_monitor import HostMonitor
 from .lobby_dialogs import ChannelLogDialog, ChannelMembersDialog
-
-LOBBY_STYLE = CHANNEL_NAV_STYLE + f"""
-QWidget#participantLobby {{ background: {SURFACE}; }}
-"""
-
 
 SocketState = QAbstractSocket.SocketState
 
@@ -98,7 +94,9 @@ class LobbyWindow(QWidget):
         self._channel_id = ""
         self._history_has_more = False
         self._host_open = True if session is not None else None
+        self._host_checking = session is None
         self._host_monitor = None
+        self._offline_login_pending = False
         self._log_dialogs = {}
         self._members_dialogs = {}
         self._info_dialogs = {}
@@ -141,14 +139,10 @@ class LobbyWindow(QWidget):
         self.address = QLineEdit(address)
         self.nickname = QLineEdit()
         self.nickname.setPlaceholderText("输入临时昵称")
-        if self._managed:
-            self.connection_button = QPushButton("连接")
-            self.connection_button.setObjectName("primary")
-            self.connect_button = self.disconnect_button = self.connection_button
-        else:
+        if not self._managed:
             self.connect_button = QPushButton("连接")
             self.disconnect_button = QPushButton("断开")
-        self.connection_status = ElidedLabel() if self._managed else QLabel()
+            self.connection_status = QLabel()
         self.channel_choice = ChannelTree(managed=False) if self._managed else QComboBox()
         if not self._managed:
             self.channel_choice.hide()
@@ -156,7 +150,7 @@ class LobbyWindow(QWidget):
         self.feedback = FeedbackLabel()
         self.feedback.setTextFormat(Qt.TextFormat.PlainText)
         self.feedback.setWordWrap(True)
-        self.chat_history = ChatHistory(conversation=self._managed)
+        self.chat_history = ChatHistory(conversation=self._managed, fade_top=self._managed)
         self.chat_history.setPlaceholderText("暂无可查看的消息")
         self.chat_history.olderRequested.connect(self._load_older)
         self.message = ChatComposer() if self._managed else QPlainTextEdit()
@@ -185,14 +179,18 @@ class LobbyWindow(QWidget):
                     self._show_cached_page()
             except (OSError, sqlite3.Error, ValueError):
                 self.feedback.setText("无法读取本地频道信息。")
-        campaign_id = session.campaign_id if session is not None else self._base_cache.scope[0] if self._base_cache is not None else None
-        if self._managed and campaign_id is not None:
+        if self._managed:
+            campaign_id = session.campaign_id if session is not None else None
+            if campaign_id is None and self._base_cache is not None:
+                campaign_id = self._base_cache.scope[0]
             self._host_monitor = HostMonitor(address, campaign_id, self)
             self._host_monitor.changed.connect(self._host_state_changed)
             self._host_monitor.start()
 
     def resume(self, session: ClientSession, cache: HistoryCache) -> None:
         self.session = session
+        if self._host_monitor is not None:
+            self._host_monitor.campaign_id = session.campaign_id
         self.nickname.setText(session.actor_name)
         if self._cache is None:
             self._base_cache = cache
@@ -216,9 +214,9 @@ class LobbyWindow(QWidget):
             layout.addWidget(self.message)
             layout.addWidget(self.send_button)
             return
-        self.setObjectName("participantLobby")
+        self.setObjectName("channelWorkspace")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(STYLE + LOBBY_STYLE)
+        self.setStyleSheet(STYLE + CHANNEL_NAV_STYLE)
         self.address.setParent(self)
         self.address.hide()
         self.nickname.setParent(self)
@@ -226,23 +224,17 @@ class LobbyWindow(QWidget):
         columns = QHBoxLayout(self)
         columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(0)
-        sidebar = QFrame()
-        sidebar.setObjectName("participantSidebar")
-        left = QVBoxLayout(sidebar)
-        left.setContentsMargins(16, 16, 16, 16)
-        left.setSpacing(12)
-        left.addWidget(self.connection_status)
-        left.addSpacing(16)
-        left.addWidget(self.channel_choice, 1)
-        self.personal_info_button = QPushButton("个人信息")
+        self._sidebar = ParticipantSidebar(self.channel_choice, self)
+        self.connection_button = self._sidebar.connection_button
+        self.connect_button = self.disconnect_button = self.connection_button
+        self.personal_info_button = self._sidebar.personal_button
         self.personal_info_button.clicked.connect(lambda _checked=False: self.personalInfoRequested.emit())
-        left.addWidget(self.personal_info_button)
-        left.addWidget(self.connection_button)
-        chat_panel = QWidget()
+        chat_panel = QFrame()
+        chat_panel.setObjectName("channelChatPanel")
         right = QVBoxLayout(chat_panel)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
-        self.channel_header = ChannelHeader()
+        self.channel_header = ChannelHeader(divider=False)
         self.channel_info_button = self.channel_header.description_button
         self.channel_info_button.clicked.connect(self._open_channel_info)
         self.channel_members_button = self.channel_header.members_button
@@ -258,11 +250,12 @@ class LobbyWindow(QWidget):
         composer.addWidget(self.feedback)
         composer.addWidget(self.message)
         right.addLayout(composer)
-        self.channel_splitter = split_channel_view(sidebar, chat_panel)
+        self.channel_splitter = split_channel_view(self._sidebar, chat_panel)
         columns.addWidget(self.channel_splitter)
 
     def _connect_signals(self) -> None:
         if self._managed:
+            self._sidebar.server_status.clicked.connect(self._refresh_server_status)
             self.connection_button.clicked.connect(self._toggle_connection)
             self.message.sendRequested.connect(self._send_message)
         else:
@@ -287,17 +280,23 @@ class LobbyWindow(QWidget):
         else:
             self._open_connection()
 
-    def _host_state_changed(self, state):
-        self._host_open = state
-        self._update_status_label()
+    @Slot()
+    def _refresh_server_status(self) -> None:
+        self._host_checking = True
+        self._update_server_status()
+        self._sidebar.show_server_status()
+        self._host_monitor.check()
 
-    def _update_status_label(self):
-        connected = self.socket.state() == SocketState.ConnectedState
-        if not self._managed:
-            self.connection_status.setText(STATE_LABELS.get(self.socket.state(), "正在连接…"))
-            return
-        opened = "已开启" if connected or self._host_open is True else "未开启" if self._host_open is False else "检测中"
-        self.connection_status.setText(opened + "-" + ("已连接" if connected else "未连接"))
+    def _host_state_changed(self, state: bool | None) -> None:
+        self._host_checking = False
+        self._host_open = state
+        self._update_server_status()
+
+    def _update_server_status(self) -> None:
+        opened = self._host_open
+        if opened is None and self.socket.state() == SocketState.ConnectedState:
+            opened = True
+        self._sidebar.set_server_state(opened, checking=self._host_checking)
 
     @staticmethod
     def _show_dialog(dialog):
@@ -487,7 +486,7 @@ class LobbyWindow(QWidget):
             self._retry_count += 1
             self._reconnect_timer.start(delay)
         else:
-            message = "自动重连失败，可以点击「重新连接」再试。"
+            message = "自动重连失败，可以点击左下角的连接图标再试。"
             if self.retry_send is not None:
                 message += "未确认的消息已保留。"
             self.feedback.setText(message)
@@ -497,24 +496,40 @@ class LobbyWindow(QWidget):
         if code == "invalid_session":
             self.sessionRejected.emit()
 
+    def set_offline_login_pending(self, pending: bool) -> None:
+        self._offline_login_pending = pending
+        self._update_connection_button(self.socket.state())
+
+    def _update_connection_button(self, state: SocketState) -> None:
+        if self._offline_login_pending:
+            self._sidebar.set_connection_state(False, "正在连接", "本机未连接 · 正在等待主机响应…")
+            self.connection_button.setEnabled(False)
+            return
+        connected = state == SocketState.ConnectedState
+        idle = state == SocketState.UnconnectedState
+        waiting_to_retry = self._reconnect_timer.isActive()
+        action = "取消重连" if waiting_to_retry else "断开连接" if not idle else "连接"
+        status = "本机已连接" if connected else "本机未连接"
+        if not connected:
+            if waiting_to_retry or (self._opening and self._retry_count > 0):
+                status += f" · 正在重连（{self._retry_count}/{len(RECONNECT_DELAYS_MS)}）…"
+            elif not idle:
+                status += f" · {STATE_LABELS.get(state, '正在连接…')}"
+        self._sidebar.set_connection_state(connected, action, status)
+        self.connection_button.setEnabled(state != SocketState.ClosingState)
+
     def _update_connection_state(self, state: SocketState) -> None:
         connected = state == SocketState.ConnectedState
         idle = state == SocketState.UnconnectedState
 
         waiting_to_retry = self._reconnect_timer.isActive()
-        reconnecting = waiting_to_retry or (self._opening and self._retry_count > 0)
-        status = STATE_LABELS.get(state, "正在连接…")
-        if reconnecting:
-            status = f"正在重连（{self._retry_count}/{len(RECONNECT_DELAYS_MS)}）…"
         if self._managed:
             if connected:
                 self._host_open = True
-            self._update_status_label()
-            self.connection_button.setText("取消重连" if waiting_to_retry else "断开连接" if connected or not idle else "连接")
-            self.connection_button.setEnabled(state != SocketState.ClosingState)
-            self.connection_button.setToolTip(status)
+            self._update_server_status()
+            self._update_connection_button(state)
         else:
-            self.connection_status.setText(status)
+            self.connection_status.setText(STATE_LABELS.get(state, "正在连接…"))
         self.address.setEnabled(idle)
         self.nickname.setEnabled(idle)
         if not self._managed:
@@ -549,7 +564,7 @@ class LobbyWindow(QWidget):
             if not connected:
                 placeholder = "未连接"
             elif channel.get("attributes_required") is True:
-                placeholder = "请先在「个人属性」中导入角色属性"
+                placeholder = "请先通过「个人」导入角色属性"
             else:
                 placeholder = f"发送到 {channel.get('name', '')}" if can_send else "频道只读"
             self.message.setPlaceholderText(placeholder)

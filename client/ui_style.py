@@ -78,10 +78,13 @@ QPushButton {{ padding: 8px 14px; }}
 """
 
 CHANNEL_NAV_STYLE = f"""
-QFrame#participantSidebar, QFrame#lobbySidebar {{ background: {SIDEBAR}; }}
-QSplitter#channelSplitter::handle:horizontal {{ background: {SIDEBAR}; border-right: 1px solid {BORDER}; }}
-QSplitter#channelSplitter::handle:horizontal:hover {{ background: {SELECTION}; }}
-QSplitter#channelSplitter::handle:horizontal:pressed {{ background: {BORDER}; }}
+QWidget#channelWorkspace, QFrame#channelSidebar {{ background: {BACKGROUND}; }}
+QSplitter#channelSplitter::handle:horizontal {{ background: {BACKGROUND}; border: none; }}
+QSplitter#channelSplitter::handle:horizontal:hover {{ background: {HOVER}; }}
+QSplitter#channelSplitter::handle:horizontal:pressed {{ background: {SELECTION}; }}
+QFrame#channelChatPanel {{
+    background: {SURFACE}; border-top-left-radius: 12px; border-bottom-left-radius: 12px;
+}}
 QTreeWidget#channelTree {{ background: transparent; border: none; outline: none; }}
 QPushButton#groupAdd {{ border: 1px solid transparent; background: transparent; padding: 0; color: {MUTED}; font-size: 20px; }}
 QPushButton#groupAdd:hover {{ background: {SELECTION}; }}

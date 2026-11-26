@@ -10,7 +10,6 @@ from .ui_widgets import ElidedButton, ElidedLabel
 
 ICON_SIZE = 20
 STYLE = f"""
-QFrame#channelHeader {{ background: {SURFACE}; border-bottom: 1px solid {BORDER}; }}
 QLabel#channelTitle {{ color: {TEXT}; font-size: 16px; font-weight: 600; }}
 QLabel#channelSeparator {{ color: {DISABLED}; font-size: 16px; font-weight: 600; }}
 QPushButton#channelDescription, QToolButton#channelAction, QToolButton#archiveChannel {{
@@ -27,13 +26,14 @@ QPushButton#channelDescription:focus, QToolButton#channelAction:focus, QToolButt
     border-color: {FOCUS};
 }}
 """
+DIVIDER_STYLE = f"QFrame#channelHeader {{ background: {SURFACE}; border-bottom: 1px solid {BORDER}; }}"
 
 
 class ChannelHeader(QFrame):
-    def __init__(self, *, can_archive: bool = False) -> None:
+    def __init__(self, *, can_archive: bool = False, divider: bool = True) -> None:
         super().__init__()
         self.setObjectName("channelHeader")
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(STYLE + (DIVIDER_STYLE if divider else ""))
         self.setFixedHeight(48)
 
         top = QHBoxLayout(self)
